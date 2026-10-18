@@ -28,6 +28,8 @@
 
 ## 开始使用
 
+**[下载 v0.2.0 预览版 · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.0/Minorminor-v0.2.0-macos-arm64.zip)**。解压后将 `Minorminor.app` 拖入「应用程序」。仅 ad-hoc 签名，尚未公证；[发布说明与校验值](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0)。
+
 源码运行需要 **macOS 12+、Git、Rust 1.88+ 和 Xcode Command Line Tools**。
 
 ```sh

@@ -63,7 +63,7 @@ The benchmark checks every file, directory and logical size, then compares stora
 
 Local release benchmark on 2026-10-19: 61,204 files, 2,007 directories and 1,200 session associations, alternating three runs per binary on the same fixture. Median time fell from 18.754 s to 2.158 s (about 8.7×), with identical indexes across all six runs. These are local fixture measurements; actual times depend on storage, cloud directories and permissions, and do not imply the same speedup on every Mac.
 
-The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. No universal binary or formal installer has been published.
+The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. The [v0.2.0 preview](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0) provides an Apple Silicon build; no universal binary or notarized installer is available.
 
 UI translations live in `public/locales/en.js`. Use `tr` / `ui` for authored text; interpolate file paths and content unchanged instead of translating the whole DOM.
 

@@ -73,7 +73,7 @@ python3 scripts/benchmark-native-scan.py --baseline /path/to/previous/Minorminor
 
 两项 Python 3 测试验证打包后的应用及本地模拟 AI / Ollama 服务。
 
-生成 `dist/Minorminor.app`，只包含当前机器架构。构建脚本复制固定版本 Mole、保护脚本和许可文件，并验证 ad-hoc 签名；这不等于 Apple Developer ID 签名或公证。当前未发布通用二进制或正式安装包。
+生成 `dist/Minorminor.app`，只包含当前机器架构。构建脚本复制固定版本 Mole、保护脚本和许可文件，并验证 ad-hoc 签名；这不等于 Apple Developer ID 签名或公证。[v0.2.0 预览包](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0)仅提供 Apple Silicon 版本，未提供通用二进制或公证安装包。
 
 文案位于 `public/locales/en.js`；界面使用 `tr` / `ui` 翻译固定文案，文件路径与内容作为插值保留，不对整个 DOM 执行翻译。
 

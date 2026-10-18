@@ -28,6 +28,8 @@ This repository independently maintains the **Rust Application**. The [Minormino
 
 ## Get started
 
+**[Download v0.2.0 preview · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.0/Minorminor-v0.2.0-macos-arm64.zip)**. Unzip and drag `Minorminor.app` into Applications. Ad-hoc signed, not notarized; see [release notes and checksums](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0).
+
 Source builds require **macOS 12+, Git, Rust 1.88+ and Xcode Command Line Tools**.
 
 ```sh
