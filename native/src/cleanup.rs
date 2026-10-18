@@ -24,6 +24,16 @@ pub fn block(
     home: &Path,
     personal: bool,
 ) -> Option<String> {
+    block_review(path, m, kind, home, personal, false)
+}
+fn block_review(
+    path: &Path,
+    m: &fs::Metadata,
+    kind: &str,
+    home: &Path,
+    personal: bool,
+    allow_recent: bool,
+) -> Option<String> {
     if !path.starts_with(home) || path == home {
         return Some("超出当前用户文件范围".into());
     }
@@ -36,13 +46,19 @@ pub fn block(
     if m.nlink() != 1 {
         return Some("共享硬链接文件保留".into());
     }
-    if !["cache", "log", "session", "memory"].contains(&kind) {
+    if !["cache", "log", "session", "memory", "installer"].contains(&kind) {
         return Some("此类文件保留".into());
     }
     if ["session", "memory"].contains(&kind) && !personal {
         return Some("会话与记忆需要单独启用".into());
     }
-    if chrono::Utc::now().timestamp() - m.mtime() < 24 * 3600 {
+    if kind == "installer"
+        && (path.parent() != Some(home.join("Downloads").as_path())
+            || chrono::Utc::now().timestamp() - m.mtime().max(m.ctime()) < 7 * 86400)
+    {
+        return Some("只整理下载目录中7天前的独立安装包".into());
+    }
+    if !allow_recent && chrono::Utc::now().timestamp() - m.mtime() < 24 * 3600 {
         return Some("最近 24 小时仍有写入，保留".into());
     }
     None
@@ -91,7 +107,7 @@ pub fn prepare(db: &mut Connection, scan_id: &str, body: &Value, home: &Path) ->
     if kinds.is_empty()
         || kinds
             .iter()
-            .any(|s| !["cache", "log", "session", "memory"].contains(&s.as_str()))
+            .any(|s| !["cache", "log", "session", "memory", "installer"].contains(&s.as_str()))
     {
         return Err(fail("无效的文件类别"));
     }
@@ -114,7 +130,17 @@ pub fn prepare(db: &mut Connection, scan_id: &str, body: &Value, home: &Path) ->
         .flatten()
         .filter_map(|s| s.as_str().map(str::to_owned))
         .collect();
-    if projects.is_empty() && tools.is_empty() && !body["allCaches"].as_bool().unwrap_or(false) {
+    let paths: HashSet<String> = body["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    if projects.is_empty()
+        && tools.is_empty()
+        && paths.is_empty()
+        && !body["allCaches"].as_bool().unwrap_or(false)
+    {
         return Err(fail("请勾选要预览的项目或工具"));
     }
     let mut stmt=db.prepare("SELECT path,category,identity,project,tool,bytes FROM entries WHERE scan=? AND directory=0 AND category<>'other'")?;
@@ -146,13 +172,14 @@ pub fn prepare(db: &mut Connection, scan_id: &str, body: &Value, home: &Path) ->
         if !kinds.contains(&kind) {
             continue;
         }
-        let selected = project
-            .as_ref()
-            .map(|p| projects.contains(p))
-            .unwrap_or(false)
+        let selected = paths.contains(&path)
+            || project
+                .as_ref()
+                .map(|p| projects.contains(p))
+                .unwrap_or(false)
             || tool.as_ref().map(|p| tools.contains(p)).unwrap_or(false)
             || body["allCaches"].as_bool().unwrap_or(false)
-                && ["cache", "log"].contains(&kind.as_str());
+                && ["cache", "log", "installer"].contains(&kind.as_str());
         if !selected {
             continue;
         }
@@ -171,6 +198,10 @@ pub fn prepare(db: &mut Connection, scan_id: &str, body: &Value, home: &Path) ->
                 params![scan_id, index::path_string(&path)],
                 |r| r.get(0),
             )?;
+            let unreadable:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM errors WHERE scan=? AND path=? AND code IN ('SESSION_READ_ERROR','DB_READ_ERROR'))",params![scan_id,index::path_string(&path)],|r|r.get(0))?;
+            if unreadable {
+                return Err(fail("关联内容未读完整，保留"));
+            }
             if managed {
                 return Err(fail("由共享数据库管理，请在所属工具内处理"));
             }
@@ -256,7 +287,13 @@ pub fn claimed_files(db: &Connection, body: &Value) -> Result<Vec<Frozen>> {
     Ok(files)
 }
 pub fn claim(db: &mut Connection, body: &Value) -> Result<Vec<Frozen>> {
-    if body["confirmation"] != "TRASH_REVIEWED_FILES" {
+    if body["confirmation"]
+        != if body["method"] == "permanent" {
+            "PERMANENT_REVIEWED_FILES"
+        } else {
+            "TRASH_REVIEWED_FILES"
+        }
+    {
         return Err(fail("请预览后明确确认移到废纸篓"));
     }
     let plan = body["planId"].as_str().ok_or_else(|| fail("缺少预览 ID"))?;
@@ -368,12 +405,23 @@ pub fn move_one<F: Fn(&Frozen) -> Result<()>>(
     home: &Path,
     guard: F,
 ) -> Result<(String, Option<PathBuf>)> {
+    process_reviewed(db, job, file, home, false, false, guard)
+}
+pub fn process_reviewed<F: Fn(&Frozen) -> Result<()>>(
+    db: &Connection,
+    job: &str,
+    file: &Frozen,
+    home: &Path,
+    allow_recent: bool,
+    permanent: bool,
+    guard: F,
+) -> Result<(String, Option<PathBuf>)> {
     let validate = || -> Result<()> {
         let m = index::checked(&file.path, home, file.identity.dev)?;
         if Identity::of(&m) != file.identity {
             return Err(fail("预览后文件身份发生变化，已保留"));
         }
-        if let Some(reason) = block(&file.path, &m, &file.kind, home, true) {
+        if let Some(reason) = block_review(&file.path, &m, &file.kind, home, true, allow_recent) {
             return Err(fail(reason));
         }
         Ok(())
@@ -454,12 +502,29 @@ pub fn move_one<F: Fn(&Frozen) -> Result<()>>(
             now(),
             index::path_string(&file.path),
             index::path_string(&target),
-            "moved",
+            if permanent { "staged" } else { "moved" },
             file.bytes,
             ""
         ],
     )?;
-    Ok(("moved".into(), Some(target)))
+    if permanent {
+        let live = fs::symlink_metadata(&target)?;
+        let parent = fs::symlink_metadata(&trash)?;
+        if Identity::of(&live) != Identity::of(&moved)
+            || parent.dev() != trash_dir.metadata()?.dev()
+            || parent.ino() != trash_dir.metadata()?.ino()
+        {
+            return Err(fail("暂存文件或目录发生变化，保留并请查看记录"));
+        }
+        let name = CString::new(target_name)?;
+        if unsafe { libc::unlinkat(trash_dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        db.execute("INSERT INTO receipts(job,created,path,status,bytes,reason) VALUES(?,?,?,'deleted',?,'已明确确认永久删除')",params![job,now(),index::path_string(&file.path),file.bytes])?;
+        Ok(("deleted".into(), None))
+    } else {
+        Ok(("moved".into(), Some(target)))
+    }
 }
 pub fn record_skip(db: &Connection, job: &str, file: &Frozen, error: &str) -> Result<()> {
     db.execute(

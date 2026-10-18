@@ -1,10 +1,200 @@
 .native-path{display:block;overflow-wrap:anywhere;color:var(--ink-3);font-size:12px;margin:8px 0}
-.native-progress{margin-bottom:20px}.native-activity{height:3px;overflow:hidden;background:var(--surface-3);margin:16px 0}.native-activity:after{content:"";display:block;width:25%;height:100%;background:var(--ink-2);animation:native-progress 1.2s linear infinite}@keyframes native-progress{from{transform:translateX(-100%)}to{transform:translateX(500%)}}
+.native-progress{margin-bottom:20px}.native-activity{height:3px;overflow:hidden;background:var(--surface-3);margin:16px 0}.native-activity:after{content:"";display:block;width:25%;height:100%;background:var(--accent);animation:native-progress 1.2s linear infinite}@keyframes native-progress{from{transform:translateX(-100%)}to{transform:translateX(500%)}}
 .native-summary-row,.native-file-row,.native-disk-row{display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px solid var(--line)}
 .native-summary-row>code,.native-file-row>:first-child{flex:1;min-width:0;overflow-wrap:anywhere}.native-file-row small{display:block;color:var(--ink-3);margin-top:4px}.native-file-row strong{white-space:nowrap}.native-summary-row>code{font-size:12px;color:var(--ink-3)}
-.native-disk-row>.text-button{width:180px;justify-content:flex-start;overflow-wrap:anywhere}.native-disk-row>strong{min-width:100px;text-align:right}.native-bar{height:14px;background:var(--surface-3);flex:1}.native-bar>i{display:block;height:100%;background:var(--ink-2)}
+.native-disk-row>.text-button{width:180px;justify-content:flex-start;overflow-wrap:anywhere}.native-disk-row>strong{min-width:100px;text-align:right}.native-bar{height:14px;background:var(--surface-3);flex:1}.native-bar>i{display:block;height:100%;background:var(--accent)}
 .native-plan-list{max-height:48vh;overflow:auto;margin:16px 0}.native-plan-row{padding:12px 0;border-bottom:1px solid var(--line)}.native-plan-row label{display:flex;gap:10px;align-items:flex-start}.native-plan-row code{font-size:12px;overflow-wrap:anywhere}.native-plan-row>span{display:block;font-size:12px;color:var(--ink-3);padding-left:24px}.native-plan-actions{position:sticky;bottom:0;background:var(--surface);padding:16px 0 0;border-top:1px solid var(--line)}
 .native-output{max-height:50vh;overflow:auto;padding:16px;border:1px solid var(--line);font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface-2)}.native-mole-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
 #native-config{display:grid;gap:14px}#native-config>label{display:grid;gap:6px}#native-config input,#native-config select{width:100%;padding:10px;border:1px solid var(--line-strong);background:var(--surface)}
 .project-file-explorer{scroll-margin-top:24px;margin-top:24px}.project-file-explorer .section-header>div{display:flex;gap:8px;flex-wrap:wrap}.file-entry-details{padding:12px 16px}.file-entry-details>code{display:block;overflow-wrap:anywhere;font-size:12px}.file-entry-details>p{margin:12px 0}.project-open{cursor:pointer}.project-clean-options>label{font-size:13px}.native-summary-row>strong{min-width:100px}.native-file-row button{min-width:0}
 @media(prefers-reduced-motion:reduce){.native-activity:after{animation:none}}@media(max-width:900px){.native-disk-row{flex-wrap:wrap}.native-disk-row small{display:none}.native-bar{min-width:120px}.native-summary-row{flex-wrap:wrap}.native-summary-row>code{order:3;flex-basis:100%}}
+.native-progress{position:sticky;top:8px;z-index:25;padding:14px 18px;margin-bottom:20px;box-shadow:var(--px-sm)}
+.native-progress .section-header{margin-bottom:8px}.native-progress h2{font-size:15px}.native-progress-controls{display:flex;gap:12px;align-items:center;white-space:nowrap}.native-progress-controls small{font-variant-numeric:tabular-nums;color:var(--ink-3)}
+.native-progress-metrics{display:flex;gap:8px 20px;flex-wrap:wrap;font-size:12px;color:var(--ink-3)}.native-progress-metrics strong{color:var(--ink);font-variant-numeric:tabular-nums}.native-progress .native-path{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:8px 0 0}.native-progress-wait{display:block;margin-top:8px}.native-progress-failed{border-color:var(--ink-2)}.native-progress-error{margin:8px 0;font-size:13px}.native-activity.determinate:after{display:none}.native-activity>i{display:block;height:100%;background:var(--accent)}
+.parity-filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0}.parity-filters select,.parity-filters input[type=text],.parity-filters input:not([type]){padding:8px;border:1px solid var(--line-strong);background:var(--surface);min-width:100px}.parity-filters input{flex:1;min-width:180px}.parity-advice-row{display:grid;grid-template-columns:120px minmax(0,1fr) auto;gap:16px;padding:16px 0;border-bottom:1px solid var(--line)}.parity-advice-row p{margin:8px 0}.parity-advice-row small{color:var(--ink-3)}.native-plan-row>small{display:block;color:var(--ink-3);margin:4px 0}#parity-import-path{display:block;width:100%;padding:10px;margin-top:8px}.parity-filters label{font-size:13px}
+
+.parity-filters input[type=checkbox]{flex:none;min-width:0;width:16px;height:16px;margin-right:8px}.parity-filters label:has(input[type=checkbox]){display:flex;align-items:flex-start;gap:6px;flex-basis:100%}label[data-permanent-ack]{font-size:13px;margin-top:10px}label[data-permanent-ack][hidden]{display:none!important}
+
+.native-progress-percent{color:var(--accent-strong);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}.native-activity>i{transition:width .25s ease}@media(prefers-reduced-motion:reduce){.native-activity>i{transition:none}}
+
+/* ── 桌面版版式修订 ──────────────────────────────────────────────────────
+   所有面板内容统一 20px 内边距，与 section-header 的文字对齐；
+   标题在左、操作成组靠右；不可用、空状态和已结束状态降为次要层级。 */
+
+/* 面板标题行：标题占满左侧，其余操作依次靠右排列，而不是被 space-between 拉散 */
+.section-header{justify-content:flex-start;gap:10px;flex-wrap:wrap}
+.section-header>:first-child{margin-right:auto}
+.section-header>div:not(:first-child){display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.section-header .parity-filters{margin:0}
+.section-header>.export-format,.section-header select{min-height:30px;padding-block:3px;font-size:var(--fs-xs)}
+
+/* 面板里直接放置的说明、按钮组、折叠区与搜索框：与标题同一条左缘 */
+.panel>small{display:block;padding:0 20px 16px;font-size:var(--fs-xs);color:var(--ink-3);line-height:1.6}
+.panel>p{padding:0 20px 18px;font-size:var(--fs-sm);color:var(--ink-3);line-height:1.7}
+.panel>.parity-filters{margin:0 20px 16px}
+.panel>.btn,.panel>.text-button{margin:0 0 18px 20px}
+.panel>.btn+.btn,.panel>.btn+.text-button,.panel>.text-button+.text-button{margin-left:12px}
+.panel>.inventory-row-footer{justify-content:flex-start;margin:0;padding:0 20px 18px}
+.panel>.clean-search{display:block;width:calc(100% - 40px);max-width:420px;margin:0 20px 16px}
+.panel>.clean-plan-warning{margin:0 20px 16px}
+.project-panel>.project-clean-options{padding:0 20px 14px}
+.panel>details{margin:0 20px 18px;border-top:1px dashed var(--line);padding-top:12px}
+.panel>details>summary{display:inline-flex;align-items:center;gap:8px;cursor:pointer;list-style:none;font-size:var(--fs-sm);color:var(--ink-2)}
+.panel>details>summary::-webkit-details-marker{display:none}
+.panel>details>summary::before{content:"▸";font-size:var(--fs-2xs);color:var(--ink-3)}
+.panel>details[open]>summary::before{content:"▾"}
+.panel>details>summary:hover{color:var(--ink);text-decoration:underline;text-decoration-style:dotted;text-underline-offset:4px}
+.panel>details .native-mole-actions{margin-top:12px}
+
+/* 列表行：内容与标题对齐，行间虚线 */
+.panel>.native-summary-row,.panel>.native-disk-row,.panel>.native-file-row,.panel>.parity-advice-row,.panel>.native-plan-row{padding-inline:20px;border-bottom-style:dashed}
+.panel>.native-summary-row:last-child,.panel>.native-disk-row:last-child,.panel>.native-file-row:last-child{border-bottom:0}
+.native-summary-row,.native-disk-row,.native-file-row{transition:background var(--t-fast)}
+.native-summary-row:hover,.native-disk-row:hover,.native-file-row:hover{background:var(--surface-2)}
+.native-summary-row>b,.native-summary-row>strong:last-child{font-variant-numeric:tabular-nums;white-space:nowrap}
+.native-disk-row>.text-button{text-decoration:none;color:var(--ink);font-weight:500}
+.native-disk-row>.text-button:hover{text-decoration:underline;text-decoration-style:dotted}
+.native-disk-row>small{min-width:96px;text-align:right;font-size:var(--fs-2xs);color:var(--ink-3)}
+.native-bar{height:8px;box-shadow:inset 0 0 0 1px var(--line)}
+.native-bar>i{-webkit-mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 8px);mask:repeating-linear-gradient(90deg,#000 0 6px,transparent 6px 8px)}
+
+/* 空状态：括号字符提示，不再是贴边的一行字 */
+.panel.empty-state,.project-grid>.empty-state{padding:56px 24px;text-align:center;color:var(--ink-3);font-size:var(--fs-sm)}
+.panel.empty-state::before,.project-grid>.empty-state::before{content:"[ ";color:var(--ink-4)}
+.panel.empty-state::after,.project-grid>.empty-state::after{content:" ]";color:var(--ink-4)}
+/* 列表容器里没有数据时的提示文字（如「扫描后查看识别结果」）沿用同样的括号空状态，不再贴着框边 */
+:is(.agent-inventory-rows,.file-explorer-rows,.native-plan-list)>p:only-child{margin:0;padding:40px 24px;text-align:center;color:var(--ink-3);font-size:var(--fs-sm)}
+:is(.agent-inventory-rows,.file-explorer-rows,.native-plan-list)>p:only-child::before{content:"[ ";color:var(--ink-4)}
+:is(.agent-inventory-rows,.file-explorer-rows,.native-plan-list)>p:only-child::after{content:" ]";color:var(--ink-4)}
+dialog .native-plan-list>p:only-child{padding:24px 0;border:1px dashed var(--line)}
+
+/* 进度：运行中的整块面板与其他面板同一内边距；结束后收成一行状态 */
+.native-progress{padding:16px 20px}
+.native-progress .section-header{padding:0;margin-bottom:10px}
+.native-progress .native-progress-controls{margin-left:auto}
+.native-progress-failed{border-left:3px solid var(--danger)}
+.native-progress-failed h2{color:var(--danger)}
+.native-scan-report{padding:8px 16px}
+.native-scan-report>span{flex-wrap:wrap;gap:4px 14px;min-width:0}
+.native-scan-report strong{font-weight:600;color:var(--ink)}
+.native-scan-report em{font-style:normal;font-variant-numeric:tabular-nums}
+.native-scan-report>small{font-variant-numeric:tabular-nums;color:var(--ink-4)}
+.native-scan-report.is-stopped{border-left:3px solid var(--warn-line)}
+
+/* 总览：扫描卡里的控件左对齐，范围选择撑满；磁盘卡标题带图标间距 */
+.scan-controls-panel{justify-content:flex-start}
+.scan-controls-panel .scan-controls{justify-content:flex-start;width:100%;max-width:420px}
+.scan-controls-panel .scan-controls .scope-select{flex:1;min-width:0}
+.scan-controls-panel>small{font-size:var(--fs-2xs);color:var(--ink-3)}
+.storage-card>h3{grid-area:top;display:flex;align-items:center;gap:8px;font-size:var(--fs-xl);font-weight:600}
+.storage-card>h3 svg{color:var(--ink-2)}
+.stats-strip>div{justify-content:space-between}
+.stats-strip>div>.btn{flex-shrink:0}
+
+/* 项目行：分类按钮带色条，一眼区分缓存 / 日志 / 会话 / 记忆 */
+.project-size-category{border-left:3px solid var(--tone-other)}
+.project-size-category.cache{border-left-color:var(--tone-cache)}
+.project-size-category.log{border-left-color:var(--tone-log)}
+.project-size-category.session{border-left-color:var(--tone-session)}
+.project-size-category.memory{border-left-color:var(--tone-memory)}
+.project-size-category.installer{border-left-color:var(--tone-installer)}
+.project-category-options label{display:inline-flex;align-items:center;gap:8px}
+/* 项目行：路径、分类与说明统一对齐到项目名下方；「代码与其他」与操作按钮共用最后一行；空分类降为淡色 */
+.project-grid{--project-indent:32px}
+.project-grid>article>.project-size-categories{margin:8px 0 0 var(--project-indent)}
+.project-grid>article>.project-size-other{margin:6px 0 0 var(--project-indent);font-size:var(--fs-xs);color:var(--ink-3)}
+.project-grid>article>.project-size-other:nth-last-child(2){grid-column:1}
+.project-grid>article>.inventory-row-footer{margin-top:6px}
+.project-size-category.is-empty{opacity:.55;box-shadow:none;border-left-color:var(--line-strong)}
+.project-size-category.is-empty:hover{opacity:1}
+/* 勾选后整行轻微压暗，清楚标出已选范围 */
+.project-grid>article:has(input[data-project]:checked),.agent-inventory-rows>article:has(input[data-tool]:checked){background:var(--accent-soft)}
+.scan-controls-panel>small{padding:0}
+
+/* 侧栏：语言选择保留下拉箭头；设置按钮与导航左对齐 */
+.sidebar-bottom{gap:4px}
+.sidebar .language-picker{padding:6px 10px 6px 20px;gap:10px;color:var(--ink-3)}
+.sidebar .language-picker select{min-height:30px;max-width:none;padding:4px 26px 4px 8px;border:1px solid var(--line-strong);border-radius:var(--r);
+  background:var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23685A49' stroke-width='2' stroke-linecap='square'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 8px center/12px;font-size:var(--fs-xs)}
+.sidebar-bottom>.btn.text{justify-content:flex-start;min-height:36px;padding:8px 10px 8px 20px;color:var(--ink-2);text-decoration:none}
+.sidebar-bottom>.btn.text:hover{background:var(--surface-3);color:var(--ink)}
+.sidebar-version{padding-left:20px}
+.nav-group-toggle .nav-fold{color:var(--ink-4)}
+.ai-nav-group.is-open>.nav-group-toggle{color:var(--ink)}
+
+/* 底部操作条：只在有选择或预览时出现，沿用纸片硬投影 */
+.cleanup-actions{border:1px solid var(--accent-line);box-shadow:var(--px-lg)}
+@media(max-width:820px){.sidebar .language-picker{padding:6px 4px}.sidebar-bottom>.btn.text{justify-content:center;padding:8px}.sidebar-version{padding-left:0}}
+
+/* 统计行（mm-meta）：「标签 数值」成组，组间虚线竖分隔；数值等宽对齐，为 0 时弱化 */
+.mm-meta{display:flex;flex-wrap:wrap;align-items:center;row-gap:4px;font-size:var(--fs-2xs);line-height:1.6;color:var(--ink-3)}
+.mm-meta>span{display:inline-flex;align-items:baseline;gap:6px;padding:0 10px;border-left:1px dashed var(--line-strong);white-space:nowrap}
+.mm-meta>span:first-child{padding-left:0;border-left:0}
+.mm-meta em{font-style:normal}
+.mm-meta b{font-family:var(--font-mono);font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}
+.mm-meta>.is-zero b{font-weight:400;color:var(--ink-4)}
+.panel>.mm-meta{margin:0 20px 18px}
+.panel>.native-summary-row+.mm-meta{margin-top:14px}
+.project-open>.mm-meta{flex-wrap:nowrap;min-width:0;overflow:hidden}
+.native-file-row .mm-meta{justify-content:flex-end;margin-top:4px}
+.file-entry-details>.mm-meta{margin:4px 0 12px}
+.inventory-row-footer>.mm-meta{flex:1}
+/* 标题后的数量：方角小标，替代「标题 · 数字」 */
+.mm-count{display:inline-flex;align-items:center;min-width:22px;height:20px;margin-left:8px;padding:0 6px;justify-content:center;
+  border:1px solid var(--line-strong);background:var(--surface-2);color:var(--ink-2);font-family:var(--font-mono);font-size:var(--fs-2xs);font-weight:600;vertical-align:2px}
+
+/* 搜索与过滤输入：左侧放大镜，统一 36px 高度与内边距 */
+#native-search,#parity-file-query,#parity-diagnostic-query,.parity-filters input[id$="-query"]{min-height:36px;padding-left:34px;
+  background:var(--surface-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23786E61' stroke-width='2' stroke-linecap='square'%3E%3Ccircle cx='10.5' cy='10.5' r='6.5'/%3E%3Cpath d='m15.5 15.5 5 5'/%3E%3C/svg%3E") no-repeat 11px center/15px}
+#native-search:focus,#parity-file-query:focus,#parity-diagnostic-query:focus,.parity-filters input[id$="-query"]:focus{background-color:var(--surface)}
+#native-search::placeholder,.parity-filters input::placeholder{color:var(--ink-4)}
+#native-search::-webkit-search-cancel-button{-webkit-appearance:none}
+.panel>.clean-search{max-width:none}
+.parity-filters select,.parity-filters .btn{min-height:36px}
+/* 旧规则用 background 简写覆盖掉了下拉箭头，这里补回箭头并与全局下拉框保持同样的右侧留白 */
+.parity-filters select,#native-config select{padding:6px 30px 6px 10px;
+  background:var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23685A49' stroke-width='2' stroke-linecap='square'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center/14px}
+.parity-filters input:not([type=checkbox]){padding-block:6px}
+
+/* 文件浏览面板：嵌在项目/工具清单下方，四边留白一致，行内容与标题对齐 */
+.project-file-explorer{margin:8px 20px 20px}
+.project-file-explorer>.native-path{display:block;margin:0 20px 12px;font-size:var(--fs-2xs);color:var(--ink-3)}
+.project-file-explorer>.parity-filters{margin:0 20px 12px}
+.file-explorer-rows{border-top:1px dashed var(--line)}
+.file-explorer-rows .native-file-row{padding-inline:20px;border-bottom-style:dashed}
+.file-explorer-rows .native-file-row>:first-child{display:flex;align-items:center;gap:10px}
+.file-explorer-rows .native-file-row>div,.file-explorer-rows .file-entry>summary>span:last-child{text-align:right}
+.file-explorer-rows .file-entry>summary{cursor:pointer;list-style:none}
+.file-explorer-rows .file-entry>summary::-webkit-details-marker{display:none}
+.file-explorer-rows .file-entry[open]>summary{background:var(--surface-2)}
+.file-explorer-rows .file-entry>summary>span:last-child small{display:block;margin-top:4px}
+.file-explorer-rows .native-file-row>.btn.text{min-width:56px;justify-content:flex-end}
+.file-entry-details{padding:12px 20px 16px 46px;background:var(--surface-2);border-bottom:1px dashed var(--line)}
+
+/* 工具清单与选项：复选框与文字垂直居中 */
+.inventory-row-heading>label,.project-clean-options>label{display:inline-flex;align-items:center;gap:8px}
+.parity-filters label:has(input[type=checkbox]){align-items:center}
+/* AI 判读：来源选择与按钮同高 */
+.parity-filters>select{min-width:180px}
+.section-header>.quiet-tag{margin-left:auto}
+/* 弹窗：统计行、勾选行与「处理方式」下拉的间距统一 */
+dialog .mm-meta{margin:2px 0 14px}
+dialog .native-method{display:flex;align-items:center;gap:10px;margin:14px 0 4px;font-size:var(--fs-sm);color:var(--ink-2)}
+dialog .native-method select{min-width:150px}
+dialog>label:has(>input[type=checkbox]){display:flex;align-items:center;gap:8px}
+dialog details>summary{cursor:pointer;margin:10px 0;font-size:var(--fs-sm);color:var(--ink-2)}
+dialog .clean-pagination{padding-inline:0}
+/* 弹窗里的路径与次级操作：路径放进虚线框，按钮左对齐跟在路径下方 */
+dialog>code,dialog>code.native-path{display:block;margin:8px 0 0;padding:8px 10px;border:1px dashed var(--line-strong);background:var(--surface-2);font-size:var(--fs-2xs);color:var(--ink-2);overflow-wrap:anywhere}
+dialog>.inventory-row-footer{justify-content:flex-start;margin-top:12px}
+/* 模型连接：复选框不再被撑成整行输入框；权限说明标签按内容宽度显示并留出内边距 */
+#native-config input[type=checkbox]{width:auto;padding:0}
+#native-config>label:has(>input[type=checkbox]){display:flex;align-items:center;gap:8px}
+#native-config>.quiet-tag{justify-self:start;padding:4px 10px}
+/* 弹窗列表行：复选框与文字垂直居中 */
+dialog .native-plan-row>label{display:flex;align-items:center;gap:8px}
+
+/* 成功状态用绿，交互强调沿用 Tempo 的陶土橙。 */
+.native-scan-report.is-complete{border-left:3px solid var(--ok)}
+.native-scan-report.is-complete strong,.native-scan-report.is-complete>span>svg{color:var(--ok-ink)}
+.cleanup-action-summary strong{color:var(--accent-strong)}

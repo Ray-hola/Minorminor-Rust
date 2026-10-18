@@ -211,3 +211,129 @@ pub fn preview(resources: &Path, home: &Path, command: &str) -> Result<Value> {
         json!({"command":command,"mode":"preview","output":ansi.replace_all(&raw,"").into_owned(),"createdAt":crate::now()}),
     )
 }
+
+pub fn clean_terminal(text: &str) -> String {
+    let osc = regex::Regex::new(r"\x1b\][^\x07]*(?:\x07|\x1b\\)").unwrap();
+    let csi = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap();
+    csi.replace_all(&osc.replace_all(text, ""), "")
+        .chars()
+        .filter(|c| !c.is_control() || ['\n', '\t'].contains(c))
+        .collect()
+}
+// The native engine runs the pinned executable, never shell text from UI or AI.
+pub fn run_stream(
+    resources: &Path,
+    home: &Path,
+    command: &str,
+    execute: bool,
+    mut progress: impl FnMut(Value),
+) -> Result<Value> {
+    if !["clean", "purge", "installer", "optimize"].contains(&command)
+        || execute && command != "clean"
+    {
+        return Err(fail("仅 clean 支持执行，其余命令只预览"));
+    }
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg(resources.join("vendor/mole/mole")).arg(command);
+    if !execute {
+        cmd.arg("--dry-run");
+    }
+    cmd.current_dir(resources.join("vendor/mole"))
+        .env("HOME", home)
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("MOLE_DRY_RUN", if execute { "0" } else { "1" })
+        .env("MOLE_DELETE_MODE", "permanent")
+        .env("MOLE_TEST_NO_AUTH", "1")
+        .env("MO_NO_OPLOG", if execute { "0" } else { "1" })
+        .env("CI", "1")
+        .env_remove("MOLE_TEST_MODE")
+        .env_remove("MOLE_TEST_TRASH_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let _group = HelperGroup(pid as i32);
+    if std::env::var_os("MINORMINOR_WORKER").is_some() {
+        HELPER.store(pid as i32, Ordering::Relaxed);
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    for mut pipe in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()) as Box<dyn Read + Send>,
+    ] {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut buf = [0; 8192];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let start = Instant::now();
+    let mut published = Instant::now();
+    let mut output = String::new();
+    let mut exit = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(bytes) => {
+                output.push_str(&clean_terminal(&String::from_utf8_lossy(&bytes)));
+                if output.len() > 400000 {
+                    let mut cut = output.len() - 200000;
+                    while !output.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    output = output[cut..].into();
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+            Err(_) => {}
+        }
+        if published.elapsed().as_millis() >= 250 {
+            progress(json!({"output":output,"elapsedMs":start.elapsed().as_millis()}));
+            published = Instant::now();
+        }
+        if exit.is_none() {
+            exit = child.try_wait()?;
+            if exit.is_some() {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGTERM);
+                }
+            }
+        }
+        if command != "clean" && start.elapsed() > Duration::from_secs(180) {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let _ = child.wait();
+            return Err(fail("预览达到3分钟上限，已停止"));
+        }
+    }
+    let status = if let Some(status) = exit {
+        status
+    } else {
+        child.wait()?
+    };
+    progress(json!({"output":output}));
+    Ok(
+        json!({"command":command,"mode":if execute{"execute"}else{"preview"},"exitCode":status.code(),"success":status.success(),"output":output,"createdAt":crate::now()}),
+    )
+}

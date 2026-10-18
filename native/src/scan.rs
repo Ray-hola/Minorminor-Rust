@@ -10,7 +10,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -37,6 +36,7 @@ pub struct Stats {
     pub elapsed_ms: u128,
     pub current_path: String,
     pub stage: String,
+    pub rows: std::collections::BTreeMap<String, Value>,
 }
 
 pub fn protected(path: &Path) -> bool {
@@ -59,6 +59,8 @@ pub fn protected(path: &Path) -> bool {
             "backups",
             "backup",
             "fixtures",
+            "fixture",
+            ".private-backups",
             "acceptance-evidence",
             "models",
             "blobs",
@@ -118,6 +120,21 @@ pub fn category(path: &Path, tool: bool) -> &'static str {
         return "other";
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|n| n == "Downloads")
+        && ["dmg", "pkg"].contains(
+            &path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase()
+                .as_str(),
+        )
+    {
+        return "installer";
+    }
     let parts: Vec<String> = path
         .components()
         .map(|p| p.as_os_str().to_string_lossy().into_owned())
@@ -131,12 +148,30 @@ pub fn category(path: &Path, tool: bool) -> &'static str {
         return "memory";
     }
     if tool
-        && parts
-            .iter()
-            .any(|s| ["sessions", "conversations", "threads", "rollouts"].contains(&s.as_str()))
-        && [".jsonl", ".json", ".jsonl.gz", ".jsonl.zst"]
-            .iter()
-            .any(|s| name.ends_with(s))
+        && parts.iter().any(|s| {
+            [
+                "session",
+                "sessions",
+                "conversations",
+                "threads",
+                "rollouts",
+                "transcripts",
+                "history",
+                "archived_sessions",
+            ]
+            .contains(&s.as_str())
+        })
+        && [
+            ".jsonl",
+            ".json",
+            ".ndjson",
+            ".jsonl.gz",
+            ".jsonl.zst",
+            ".ndjson.gz",
+            ".ndjson.zst",
+        ]
+        .iter()
+        .any(|s| name.ends_with(s))
     {
         return "session";
     }
@@ -208,6 +243,9 @@ fn project_eligible(path: &Path, home: &Path) -> bool {
             ".runtime",
             ".Trash",
             "fixtures",
+            "fixture",
+            ".private-backups",
+            "acceptance-evidence",
             "backups",
             "backup",
             ".cache",
@@ -245,12 +283,14 @@ fn error(db: &Connection, scan: &str, path: &Path, e: &io::Error, stats: &mut St
         Some(libc::EPERM) => "EPERM",
         Some(libc::EACCES) => "EACCES",
         Some(libc::ENOENT) => "ENOENT",
+        Some(libc::ETIMEDOUT) => "ETIMEDOUT",
         _ => "READ_ERROR",
     };
     let reason = match code {
         "EPERM" => "macOS 隐私保护或文件权限阻止读取",
         "EACCES" => "文件权限不允许读取",
         "ENOENT" => "扫描期间路径已消失",
+        "ETIMEDOUT" => "云端目录读取超时，未读取部分保留",
         _ => "文件系统读取失败",
     };
     db.execute(
@@ -279,13 +319,37 @@ fn emit(stats: &Stats) -> Result<()> {
 }
 
 pub fn run(spec: ScanSpec) -> Result<()> {
+    println!(
+        "{}",
+        json!({"event":"progress","stats":{"stage":"preparing","currentPath":spec.root,"removed":0}})
+    );
+    io::stdout().flush()?;
     let db = index::connect(&spec.data.join("index.sqlite3"))?;
-    let root = fs::symlink_metadata(&spec.root)?;
+    let root = crate::cloud::metadata(&spec.root)?;
     if !root.is_dir() || root.file_type().is_symlink() || fs::canonicalize(&spec.root)? != spec.root
     {
         return Err(fail("扫描入口含符号链接或不是目录"));
     }
-    index::prune(&db)?;
+    let mut pruning = Instant::now();
+    index::prune_with_progress(&db, |table, removed| {
+        if removed == 0 || pruning.elapsed().as_millis() >= 250 {
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"preparing","removed":removed,"indexTable":table}})
+            );
+            io::stdout().flush()?;
+            pruning = Instant::now();
+        }
+        Ok(())
+    })?;
+    index::prepare_scan_indexes(&db, |name| {
+        println!(
+            "{}",
+            json!({"event":"progress","stats":{"stage":"preparing","indexTable":name}})
+        );
+        io::stdout().flush()?;
+        Ok(())
+    })?;
     let device = root.dev();
     let started = Instant::now();
     db.execute(
@@ -299,6 +363,8 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             path.to_path_buf()
         }
     };
+    let logical_root = logical(&spec.root);
+    let mut extra = crate::discovery_extra::Collector::new();
     let mut pending = vec![spec.root.clone()];
     let mut seen_dirs = HashSet::new();
     let mut hardlinks = HashSet::new();
@@ -311,7 +377,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
     let mut count = 0;
     db.execute_batch("BEGIN IMMEDIATE")?;
     while let Some(current) = pending.pop() {
-        let m = match fs::symlink_metadata(&current) {
+        let m = match crate::cloud::metadata(&current) {
             Ok(v) => v,
             Err(e) => {
                 error(&db, &spec.id, &logical(&current), &e, &mut stats)?;
@@ -329,7 +395,9 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         if !m.is_dir() || !seen_dirs.insert((m.dev(), m.ino())) {
             continue;
         }
-        if fs::canonicalize(&current).ok().as_ref() != Some(&current) {
+        if !crate::cloud::is_cloud(&current)
+            && fs::canonicalize(&current).ok().as_ref() != Some(&current)
+        {
             stats.links += 1;
             continue;
         }
@@ -342,7 +410,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             published = Instant::now();
         }
         insert(&db, &spec.id, &path, &m, 0, "other", None)?;
-        let entries = match fs::read_dir(&current) {
+        let entries = match crate::cloud::read_dir(&current) {
             Ok(v) => v,
             Err(e) => {
                 error(&db, &spec.id, &path, &e, &mut stats)?;
@@ -374,7 +442,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             if names.len() < 4096 {
                 names.push(name.to_owned());
             }
-            let m = match fs::symlink_metadata(&physical) {
+            let m = match crate::cloud::metadata(&physical) {
                 Ok(v) => v,
                 Err(e) => {
                     error(&db, &spec.id, &entry, &e, &mut stats)?;
@@ -411,6 +479,15 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             stats.files += 1;
             stats.bytes += unique;
             stats.logical_bytes += m.len();
+            if let Ok(relative) = entry.strip_prefix(&logical_root) {
+                if let Some(first) = relative.components().next() {
+                    let name = first.as_os_str().to_string_lossy().into_owned();
+                    let target = logical_root.join(&name);
+                    let row=stats.rows.entry(name.clone()).or_insert_with(||json!({"name":name,"path":target,"bytes":0,"files":0,"directory":entry!=target,"skipped":0}));
+                    row["bytes"] = json!(row["bytes"].as_u64().unwrap_or(0) + unique);
+                    row["files"] = json!(row["files"].as_u64().unwrap_or(0) + 1);
+                }
+            }
             insert(
                 &db,
                 &spec.id,
@@ -431,11 +508,24 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             }
         }
         discovery::observe_directory(&db, &spec.id, &path, &names, &spec.home)?;
+        extra.observe(&db, &spec.id, &path, &names, &spec.home)?;
     }
     db.execute_batch("COMMIT")?;
     stats.stage = "projects".into();
     stats.elapsed_ms = started.elapsed().as_millis();
     emit(&stats)?;
+    extra.finish(&db, &spec.id)?;
+    crate::discovery_extra::installations_with_progress(&db, &spec.id, &spec.home, |path| {
+        if published.elapsed().as_millis() >= 250 {
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"projects","currentPath":path}})
+            );
+            io::stdout().flush()?;
+            published = Instant::now();
+        }
+        Ok(())
+    })?;
     db.execute_batch("BEGIN IMMEDIATE")?;
     for (path, markers) in &projects {
         db.execute(
@@ -449,7 +539,28 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             ],
         )?;
     }
-    discovery::finish(&db, &spec.id, &spec.home)?;
+    discovery::finish_with_progress(&db, &spec.id, &spec.home, |path, completed, total| {
+        if completed == 0 || published.elapsed().as_millis() >= 250 {
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"projects","currentPath":path,"completed":completed,"total":total}})
+            );
+            io::stdout().flush()?;
+            published = Instant::now();
+        }
+        Ok(())
+    })?;
+    crate::project_info::enrich_with_progress(&db, &spec.id, &spec.home, |path| {
+        if published.elapsed().as_millis() >= 250 {
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"projects","currentPath":path,"completed":0,"total":0}})
+            );
+            io::stdout().flush()?;
+            published = Instant::now();
+        }
+        Ok(())
+    })?;
     stats.skipped = db.query_row(
         "SELECT count(*) FROM errors WHERE scan=?",
         [&spec.id],
@@ -463,7 +574,15 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         })?;
         mapped.collect::<std::result::Result<_, _>>()?
     };
-    for (project, path) in &roots {
+    for (i, (project, path)) in roots.iter().enumerate() {
+        if i == 0 || published.elapsed().as_millis() >= 250 {
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"projects","currentPath":path,"completed":i,"total":roots.len()}})
+            );
+            io::stdout().flush()?;
+            published = Instant::now();
+        }
         let prefix = format!("{}/", path.display());
         let upper = format!("{}0", path.display());
         db.execute(
@@ -471,33 +590,34 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             params![project, spec.id, prefix, upper],
         )?;
     }
-    db.execute("UPDATE entries SET project=(SELECT min(project) FROM associations a WHERE a.scan=entries.scan AND a.path=entries.path AND a.status IN ('readable','recovered') GROUP BY a.path HAVING count(DISTINCT project)=1) WHERE scan=? AND project IS NULL AND directory=0",[&spec.id])?;
+    assign_associated_projects(&db, &spec.id)?;
     db.execute_batch("COMMIT")?;
     stats.stage = "storage".into();
     emit(&stats)?;
-    // Each directory visits only its immediate children; a parent index keeps
-    // this pass linear in the number of entries, without a recursive re-scan.
+    // Descending binary paths put every descendant before its ancestor. The
+    // directory index supplies this order without sorting a million long paths.
     let dirs: Vec<String> = {
-        let mut stmt = db.prepare(
-            "SELECT path FROM entries WHERE scan=? AND directory=1 ORDER BY length(path) DESC",
-        )?;
+        let mut stmt =
+            db.prepare("SELECT path FROM entries WHERE scan=? AND directory=1 ORDER BY path DESC")?;
         let rows = stmt.query_map([&spec.id], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
     db.execute_batch("BEGIN IMMEDIATE")?;
     for (i, path) in dirs.iter().enumerate() {
-        let (bytes,logical,unique,files,children):(i64,i64,i64,i64,i64)=db.query_row("SELECT coalesce(sum(bytes),0),coalesce(sum(logical),0),coalesce(sum(unique_bytes),0),coalesce(sum(files),0),coalesce(sum(dirs+directory),0) FROM entries WHERE scan=? AND parent=? AND path<>?",params![spec.id,path,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
-        let skipped: i64 = db.query_row(
-            "SELECT coalesce(sum(skipped),0) FROM entries WHERE scan=? AND parent=? AND path<>?",
-            params![spec.id, path, path],
-            |r| r.get(0),
-        )?;
-        db.execute("UPDATE entries SET bytes=?,logical=?,unique_bytes=?,files=?,dirs=?,skipped=skipped+? WHERE scan=? AND path=?",params![bytes,logical,unique,files,children,skipped,spec.id,path])?;
+        let (bytes,logical,unique,files,children,skipped):(i64,i64,i64,i64,i64,i64)=db.prepare_cached("SELECT coalesce(sum(bytes),0),coalesce(sum(logical),0),coalesce(sum(unique_bytes),0),coalesce(sum(files),0),coalesce(sum(dirs+directory),0),coalesce(sum(skipped),0) FROM entries WHERE scan=? AND parent=? AND path<>?")?.query_row(params![spec.id,path,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        db.prepare_cached("UPDATE entries SET bytes=?,logical=?,unique_bytes=?,files=?,dirs=?,skipped=skipped+? WHERE scan=? AND path=?")?.execute(params![bytes,logical,unique,files,children,skipped,spec.id,path])?;
         if i % 1000 == 0 {
             db.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
+        }
+        if i == 0 || published.elapsed().as_millis() >= 250 || i + 1 == dirs.len() {
             stats.current_path = path.clone();
             stats.elapsed_ms = started.elapsed().as_millis();
-            emit(&stats)?;
+            println!(
+                "{}",
+                json!({"event":"progress","stats":{"stage":"storage","completed":i+1,"total":dirs.len(),"currentPath":path,"elapsedMs":stats.elapsed_ms}})
+            );
+            io::stdout().flush()?;
+            published = Instant::now();
         }
     }
     // Folder sizes de-duplicate a hard link inside that folder, while siblings
@@ -516,7 +636,6 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             .1
             .push(PathBuf::from(path));
     }
-    let logical_root = logical(&spec.root);
     for (_, (bytes, paths)) in groups {
         if paths.len() < 2 {
             continue;
@@ -569,12 +688,31 @@ fn insert(
     db: &Connection,
     scan: &str,
     path: &Path,
-    m: &fs::Metadata,
+    m: &crate::cloud::Metadata,
     unique: u64,
     category: &str,
     project: Option<&str>,
 ) -> Result<()> {
-    db.execute("INSERT OR REPLACE INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,files,identity,category,project) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![scan,index::path_string(path),index::path_string(path.parent().unwrap_or(path)),path.file_name().unwrap_or_default().to_string_lossy(),m.is_dir(),if m.is_file(){m.blocks()*512}else{0},if m.is_file(){m.len()}else{0},unique,if m.is_file(){1}else{0},serde_json::to_string(&Identity::of(m))?,category,project])?;
+    db.prepare_cached("INSERT OR REPLACE INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,files,identity,category,project) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")?.execute(params![scan,index::path_string(path),index::path_string(path.parent().unwrap_or(path)),path.file_name().unwrap_or_default().to_string_lossy(),m.is_dir(),if m.is_file(){m.blocks()*512}else{0},if m.is_file(){m.len()}else{0},unique,if m.is_file(){1}else{0},serde_json::to_string(&m.identity)?,category,project])?;
+    Ok(())
+}
+
+fn assign_associated_projects(db: &Connection, scan: &str) -> Result<()> {
+    // Resolve each associated path once, then look up only that entry through
+    // its primary key. Unassociated files require no association queries.
+    let mut associations = db.prepare(
+        "SELECT path,min(project) FROM associations WHERE scan=? AND status IN ('readable','recovered') GROUP BY path HAVING count(DISTINCT project)=1",
+    )?;
+    let mut update = db.prepare(
+        "UPDATE entries SET project=? WHERE scan=? AND path=? AND project IS NULL AND directory=0",
+    )?;
+    let rows = associations.query_map([scan], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (path, project) = row?;
+        update.execute(params![project, scan, path])?;
+    }
     Ok(())
 }
 
@@ -589,4 +727,57 @@ pub fn overview(db: &Connection, scan: &str) -> Result<Value> {
     let mut stmt=db.prepare("SELECT name,path,bytes,logical,files,dirs,directory,skipped FROM entries WHERE scan=? AND parent=? AND path<>? ORDER BY bytes DESC")?;
     let rows=stmt.query_map(params![scan,display,display],|r|Ok(json!({"name":r.get::<_,String>(0)?,"path":r.get::<_,String>(1)?,"bytes":r.get::<_,i64>(2)?,"logicalBytes":r.get::<_,i64>(3)?,"files":r.get::<_,i64>(4)?,"directories":r.get::<_,i64>(5)?,"directory":r.get::<_,bool>(6)?,"skipped":r.get::<_,i64>(7)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
     Ok(json!({"scan":info,"rows":rows}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn association_assignment_retains_ambiguity_status_scope_and_existing_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = index::initialize(temp.path()).unwrap();
+        let db = index::connect(&file).unwrap();
+        let cases = [
+            ("unique", false, None, Some("alpha")),
+            ("ambiguous", false, None, None),
+            ("missing", false, None, None),
+            ("recovered", false, None, Some("beta")),
+            ("owned", false, Some("local"), Some("local")),
+            ("directory", true, None, None),
+            ("unassociated", false, None, None),
+            ("null-only", false, None, None),
+        ];
+        for (path, directory, initial, _) in cases {
+            db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category,project) VALUES('current',?,'/',?,?,0,0,0,'{}','other',?)",params![path,path,directory,initial]).unwrap();
+        }
+        for (scan, path, project, status) in [
+            ("current", "unique", Some("alpha"), "readable"),
+            ("current", "unique", Some("alpha"), "recovered"),
+            ("current", "unique", None, "readable"),
+            ("other-scan", "unique", Some("other"), "readable"),
+            ("current", "ambiguous", Some("alpha"), "readable"),
+            ("current", "ambiguous", Some("beta"), "recovered"),
+            ("current", "missing", Some("alpha"), "missing"),
+            ("current", "missing", Some("alpha"), "permission"),
+            ("current", "recovered", Some("beta"), "recovered"),
+            ("current", "recovered", Some("alpha"), "unsafe"),
+            ("current", "owned", Some("alpha"), "readable"),
+            ("current", "directory", Some("alpha"), "readable"),
+            ("current", "null-only", None, "readable"),
+        ] {
+            db.execute("INSERT INTO associations(scan,id,path,indexed_path,project,tool,kind,title,status,reason,managed) VALUES(?,?,?,?,?,'tool','session','',?,'',0)",params![scan,id(),path,path,project,status]).unwrap();
+        }
+        assign_associated_projects(&db, "current").unwrap();
+        for (path, _, _, expected) in cases {
+            let actual: Option<String> = db
+                .query_row(
+                    "SELECT project FROM entries WHERE scan='current' AND path=?",
+                    [path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual.as_deref(), expected, "{path}");
+        }
+    }
 }

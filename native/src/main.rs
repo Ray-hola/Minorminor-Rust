@@ -21,6 +21,9 @@ async fn main() {
 }
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|s| s == "--directory-worker") {
+        return minorminor_core::cloud::worker();
+    }
     if args.iter().any(|s| s == "--worker") {
         minorminor_core::mole::install_worker_signals();
         let mut input = Vec::new();
@@ -42,7 +45,7 @@ async fn run() -> Result<()> {
                 }
             });
         }
-        if let Err(error) = server::worker(payload) {
+        if let Err(error) = tokio::task::spawn_blocking(move || server::worker(payload)).await? {
             println!("{}", json!({"event":"error","error":error.to_string()}));
             return Err(error);
         }
@@ -104,6 +107,7 @@ async fn run() -> Result<()> {
             window::WindowBuilder,
         };
         let event_loop = EventLoop::new();
+        eprintln!("Minorminor desktop started: pid={}", std::process::id());
         let window = WindowBuilder::new()
             .with_title("Minorminor")
             .with_inner_size(tao::dpi::LogicalSize::new(1180.0, 820.0))
@@ -150,15 +154,30 @@ async fn run() -> Result<()> {
         event_loop.run(move |event, _, control_flow| {
             let _keep_alive = (&webview, &window, &menu);
             *control_flow = ControlFlow::Wait;
-            if matches!(
-                event,
+            match event {
                 Event::WindowEvent {
                     event: WindowEvent::CloseRequested,
                     ..
-                } | Event::LoopDestroyed
-            ) {
-                engine.cancel();
-                *control_flow = ControlFlow::Exit;
+                } => {
+                    let scanning = engine.background_scan_running();
+                    eprintln!("Minorminor window close requested: background_scan={scanning}");
+                    if scanning {
+                        window.set_visible(false);
+                    } else {
+                        engine.cancel();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                Event::Reopen { .. } => {
+                    window.set_visible(true);
+                    window.set_focus();
+                }
+                Event::LoopDestroyed => {
+                    eprintln!("Minorminor event loop destroyed");
+                    engine.cancel();
+                }
+                _ => {}
             }
         });
     }

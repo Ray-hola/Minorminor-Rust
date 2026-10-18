@@ -17,3 +17,13 @@ pub fn now() -> String {
 pub fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+pub mod advice;
+pub mod candidates;
+pub mod cloud;
+pub mod database;
+pub mod discovery_extra;
+pub mod measure;
+pub mod project_info;
+pub mod reports;
+pub mod review;

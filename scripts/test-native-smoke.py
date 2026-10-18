@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the packaged Rust process with disposable files only."""
-import json, os, pathlib, signal, subprocess, tempfile, time, urllib.request
+import json, os, pathlib, sqlite3, signal, subprocess, tempfile, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP = ROOT / 'dist/Minorminor.app/Contents/MacOS/Minorminor'
@@ -45,9 +45,34 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
             raise AssertionError('Worker timed out')
         boot = api('bootstrap')
         token = boot['token']
+        for asset in ['native.js','native-progress.js','motion.js','i18n.js']:
+            with opener.open(url+'/'+asset,timeout=8) as response:
+                assert response.read()==(ROOT/'public'/asset).read_bytes(), 'Packaged UI is stale: '+asset
         assert boot['native'] and boot['config']['permissions']['analysisDocumentRead'] is False
         api('preferences', {'locale':'en'})
         assert api('bootstrap')['preferences']['locale'] == 'en'
+        # Hold the index writer lock: task status and cancellation must remain
+        # responsive even while the worker cannot write its first scan row.
+        lock = sqlite3.connect(data / 'index.sqlite3')
+        lock.execute('BEGIN IMMEDIATE')
+        started = time.monotonic()
+        blocked = api('scan', {'scope':'home'})
+        running = next(j for j in api('jobs')['jobs'] if j['id'] == blocked['id'])
+        assert running['status'] == 'running' and running['stats']['stage'] == 'preparing'
+        capacity=running['stats']['diskSnapshot']
+        assert capacity['total']>0 and capacity['free']>=0 and capacity['capturedAt']
+        assert running['stats']['estimatedBytes']==capacity['used']
+        assert running['stats']['estimateSource']=='volume-used'
+        api('cancel', {})
+        assert time.monotonic() - started < 2, 'Status or cancel waited on the database'
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            cancelled = next(j for j in api('jobs')['jobs'] if j['id'] == blocked['id'])
+            if cancelled['status'] == 'cancelled': break
+            time.sleep(.02)
+        assert cancelled['status'] == 'cancelled', cancelled
+        lock.rollback()
+        lock.close()
         result, boot = wait(api('scan', {'scope':'home'}))
         scan = boot['scan']['id']
         assert scan == result['scanId'] and boot['models']['scanId'] == scan
@@ -76,9 +101,29 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
         assert pathlib.Path(moved['target']).read_bytes() == b'cache' * 2048
         assert api('bootstrap')['stale'] is True
         assert not any(b'PRIVATE_TRANSCRIPT_MARKER' in p.read_bytes() for p in data.glob('index.sqlite3*'))
-        wait(api('scan', {'scope':'home'}))
+        previous_bytes=api('bootstrap')['scan']['stats']['bytes']
+        recalibrated=api('scan', {'scope':'home'})
+        wait(recalibrated)
+        recalibrated_job=next(j for j in api('jobs')['jobs'] if j['id']==recalibrated['id'])
+        assert recalibrated_job['stats']['estimateSource']=='previous-scan'
+        assert recalibrated_job['stats']['estimatedBytes']==previous_bytes
         assert api('bootstrap')['stale'] is False
-        print('PASS: packaged Rust worker, atomic scan, project association, folder size, frozen selection, Mole guard, Trash receipt, rescan and language persistence')
+        # Exercise the actual pinned Mole whitelist policy, using only an owned cache.
+        protected = home / 'Library/Caches/WhitelistFixture/keep.bin'
+        protected.parent.mkdir(parents=True)
+        protected.write_bytes(b'whitelisted cache')
+        os.utime(protected, (time.time() - 172800,) * 2)
+        whitelist = home / '.config/mole/whitelist'
+        whitelist.parent.mkdir(parents=True, exist_ok=True)
+        whitelist.write_text(str(protected.parent) + '\n')
+        wait(api('scan', {'scope':'home'}))
+        scan = api('bootstrap')['scan']['id']
+        plan = api('preview', {'scanId':scan, 'categories':['cache'], 'allCaches':True})
+        rows = api('preview/files', {'planId':plan['id']})['rows']
+        selected = next(r for r in rows if r['path'] == str(protected))
+        result, _ = wait(api('execute', {'planId':plan['id'], 'ids':[selected['id']], 'confirmation':'TRASH_REVIEWED_FILES'}))
+        assert result['moved'] == 0 and result['skipped'] == 1 and protected.exists()
+        print('PASS: packaged Rust worker, atomic scan, project association, folder size, frozen selection, Mole guard and whitelist, Trash receipt, rescan and language persistence; progress and cancellation under a locked index')
     finally:
         process.send_signal(signal.SIGINT)
         try:

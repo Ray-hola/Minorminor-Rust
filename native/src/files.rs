@@ -12,7 +12,7 @@ use std::{
     io::Read,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,16 +97,18 @@ pub fn read_prefix(
     Ok((bytes, identity))
 }
 pub fn redact(text: &str) -> String {
-    let mut value = text.to_owned();
-    for pattern in [
+    static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| [
         r"(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----",
         r"(?i)\b(?:sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,})",
         r#"(?im)["']?(?:[a-z0-9_]*(?:api[_-]?key|access[_-]?token|secret|password|authorization))["']?\s*[=:]\s*(?:"[^"\n]*"|'[^'\n]*'|[^\s,"'\n}]+)"#,
         r"(?i)\bBearer\s+[a-z0-9._~+/=-]+",
         r"(?i)https?://[^\s/@:]+:[^\s/@]+@",
-    ] {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            value = re.replace_all(&value, "[已隐藏凭据]").into_owned();
+    ].into_iter().map(|pattern| regex::Regex::new(pattern).expect("static credential pattern")).collect());
+    let mut value = text.to_owned();
+    for re in patterns {
+        if let std::borrow::Cow::Owned(redacted) = re.replace_all(&value, "[已隐藏凭据]") {
+            value = redacted;
         }
     }
     value
@@ -130,43 +132,61 @@ pub fn purpose(path: &Path, kind: &str) -> String {
     }
     .into()
 }
+#[derive(Deserialize)]
+struct StorageIdentity {
+    dev: Option<u64>,
+    ino: Option<u64>,
+}
+
+fn project_storage(db: &Connection, scan: &str, project: &str) -> Result<(i64, i64, Value)> {
+    // Stream each project once without disk-backed identity sorts. Preserve
+    // deduplication even if a single-link file moved during traversal.
+    let mut query = db.prepare_cached("SELECT category,bytes,identity FROM entries WHERE scan=? AND project=? AND directory=0")?;
+    let mut entries = query.query(params![scan, project])?;
+    let mut bytes = 0_i64;
+    let mut files = 0_i64;
+    let mut categories: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut links = HashMap::new();
+    let mut category_links = HashMap::new();
+    while let Some(row) = entries.next()? {
+        let category: String = row.get(0)?;
+        let size: i64 = row.get(1)?;
+        let identity: StorageIdentity = serde_json::from_str(row.get_ref(2)?.as_str()?)?;
+        files += 1;
+        let totals = categories.entry(category.clone()).or_default();
+        totals.1 += 1;
+        let key = (identity.dev, identity.ino);
+        let previous = links.entry(key).or_insert(0_i64);
+        bytes += (size - *previous).max(0);
+        *previous = (*previous).max(size);
+        let previous = category_links.entry(category).or_insert_with(HashMap::new).entry(key).or_insert(0_i64);
+        totals.0 += (size - *previous).max(0);
+        *previous = (*previous).max(size);
+    }
+    let categories: serde_json::Map<String, Value> = categories.into_iter()
+        .map(|(kind, (bytes, files))| (kind, json!({"bytes":bytes,"files":files})))
+        .collect();
+    Ok((bytes, files, json!(categories)))
+}
+
 pub fn projects(db: &Connection, scan: &str) -> Result<Value> {
-    let mut stmt=db.prepare("SELECT p.id,p.path,p.name,p.markers,coalesce(sum(e.bytes),0),count(e.path) FROM projects p LEFT JOIN entries e ON e.scan=p.scan AND e.project=p.id AND e.directory=0 WHERE p.scan=? GROUP BY p.id ORDER BY 5 DESC")?;
-    let base = stmt
-        .query_map([scan], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })?
+    let mut stmt = db.prepare("SELECT id,path,name,markers FROM projects WHERE scan=?")?;
+    let base = stmt.query_map([scan], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut rows = Vec::new();
-    for (id, path, name, markers, _bytes, count) in base {
-        let bytes:i64=db.query_row("SELECT coalesce(sum(bytes),0) FROM (SELECT max(bytes) AS bytes FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY json_extract(identity,'$.dev'),json_extract(identity,'$.ino'))",params![scan,id],|r|r.get(0))?;
-        let mut kinds = HashMap::new();
-        let mut query=db.prepare("SELECT category,sum(bytes),sum(files) FROM (SELECT category,max(bytes) AS bytes,count(*) AS files FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY category,json_extract(identity,'$.dev'),json_extract(identity,'$.ino')) GROUP BY category")?;
-        for row in query.query_map(params![scan, id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                json!({"bytes":r.get::<_,i64>(1)?,"files":r.get::<_,i64>(2)?}),
-            ))
-        })? {
-            let (k, v) = row?;
-            kinds.insert(k, v);
-        }
+    for (id, path, name, markers) in base {
+        let (bytes, count, kinds) = project_storage(db, scan, &id)?;
         let associations: i64 = db.query_row(
             "SELECT count(*) FROM associations WHERE scan=? AND project=? AND kind='session'",
             params![scan, id],
             |r| r.get(0),
         )?;
-        rows.push(json!({"id":id,"name":name,"path":path,"exists":Path::new(&path).is_dir(),"bytes":bytes,"files":count,"categories":kinds,"sessions":associations,"markers":serde_json::from_str::<Value>(&markers).unwrap_or(json!([]))}));
+        rows.push(json!({"id":id,"name":name,"path":path,"exists":Path::new(&path).is_dir(),"bytes":bytes,"files":count,"categories":kinds,"sessions":associations,"markers":serde_json::from_str::<Value>(&markers).unwrap_or(json!([])),"description":index::setting(db,&format!("project-info-{scan}-{id}"))?.unwrap_or(json!({}))["description"]}));
     }
+    rows.sort_by(|a,b| b["bytes"].as_i64().cmp(&a["bytes"].as_i64()).then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
     Ok(json!({"rows":rows}))
 }
+
 pub fn list(
     db: &Connection,
     resources: &Resources,
@@ -209,6 +229,12 @@ pub fn list(
     } else {
         root.clone()
     };
+    if let Some(parent_project) = project {
+        let nested:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE scan=?1 AND id<>?2 AND path<>?3 AND (path=?4 OR substr(?4,1,length(path)+1)=path||'/') AND substr(path,1,length(?3)+1)=?3||'/')",params![scan_id,parent_project,index::path_string(&root),index::path_string(&directory)],|r|r.get(0))?;
+        if nested {
+            return Err(fail("此目录属于独立子项目，请从对应项目展开"));
+        }
+    }
     let query = request["query"].as_str().unwrap_or("").to_lowercase();
     let scope = if kind == "tree" {
         "parent=?3"
@@ -219,7 +245,17 @@ pub fn list(
     } else {
         "category=?4 AND directory=0 AND ?3 IS NOT NULL"
     };
-    if !["tree", "cache", "log", "session", "memory", "other"].contains(&kind) {
+    if ![
+        "tree",
+        "cache",
+        "log",
+        "session",
+        "memory",
+        "other",
+        "installer",
+    ]
+    .contains(&kind)
+    {
         return Err(fail("无效的文件分类"));
     }
     let order = match request["sort"].as_str().unwrap_or("size") {
@@ -282,7 +318,18 @@ pub fn list(
             params![scan_id, path],
             |r| r.get(0),
         )?;
-        rows.push(json!({"id":id,"path":path,"name":name,"directory":directory,"bytes":bytes,"logicalBytes":logical,"files":files,"directories":dirs,"skipped":skipped,"kind":category,"purpose":purpose(&file,&category),"canRead":!directory&&!scan::protected(&file),"canSummarize":file.starts_with(home)}));
+        let child_project: Option<String> = if directory {
+            db.query_row(
+                "SELECT id FROM projects WHERE scan=? AND path=?",
+                params![scan_id, path],
+                |r| r.get(0),
+            )
+            .ok()
+            .filter(|p: &String| Some(p.as_str()) != project)
+        } else {
+            None
+        };
+        rows.push(json!({"projectId":child_project,"id":id,"path":path,"name":name,"directory":directory,"bytes":bytes,"logicalBytes":logical,"files":files,"directories":dirs,"skipped":skipped,"kind":category,"purpose":purpose(&file,&category),"canRead":!directory&&!scan::protected(&file),"canSummarize":file.starts_with(home)}));
     }
     let total:i64=db.query_row(&format!("SELECT count(*) FROM entries WHERE scan=?1 AND path<>?2 AND {scope} AND (?5='' OR instr(lower(name),?5)>0)"),params![scan_id,index::path_string(&directory),filter,kind,query],|r|r.get(0))?;
     let root_resource = fs::symlink_metadata(&directory).ok().map(|m| {
@@ -325,6 +372,46 @@ pub fn inspect(resource: &Resource) -> Result<Value> {
         redact(text).chars().take(4000).collect()
     };
     Ok(
-        json!({"mode":"content","excerpt":excerpt,"bytesRead":bytes.len(),"truncated":(bytes.len() as u64)<identity.size||((name.ends_with(".gz")||name.ends_with(".zst"))&&bytes.len()>=32768),"summary":"本机内容片段，不上传"}),
+        json!({"mode":"content","excerpt":excerpt,"logMetadata":if resource.path.to_string_lossy().contains("/logs/")||resource.path.extension().is_some_and(|e|e=="log"){crate::project_info::log_metadata(&resource.path,&resource.root)}else{Value::Null},"bytesRead":bytes.len(),"truncated":(bytes.len() as u64)<identity.size||((name.ends_with(".gz")||name.ends_with(".zst"))&&bytes.len()>=32768),"summary":"本机内容片段，不上传"}),
     )
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_project_storage_matches_full_sql_reference() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = index::initialize(temp.path()).unwrap();
+        let db = index::connect(&file).unwrap();
+        let cases = [
+            ("scan", "project", "cache", 10, 1, 1, false),
+            ("scan", "project", "cache", 10, 1, 1, false),
+            ("scan", "project", "log", 20, 2, 3, false),
+            ("scan", "project", "log", 30, 2, 3, false),
+            ("scan", "project", "memory", 30, 2, 3, false),
+            ("scan", "other", "log", 40, 2, 3, false),
+            ("other", "project", "log", 100, 2, 3, false),
+            ("scan", "project", "other", 500, 3, 1, true),
+        ];
+        for (i, (scan, project, category, bytes, ino, nlink, directory)) in cases.into_iter().enumerate() {
+            // A moved single-link file can leave two indexed paths too.
+            db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category,project) VALUES(?,?,'/','file',?,?,0,0,?,?,?)",
+                params![scan,format!("/{i}"),directory,bytes,json!({"dev":1,"ino":ino,"nlink":nlink}).to_string(),category,project]).unwrap();
+        }
+        for project in ["project", "other", "empty"] {
+            let actual = project_storage(&db, "scan", project).unwrap();
+            let expected: i64 = db.query_row("SELECT coalesce(sum(bytes),0) FROM (SELECT max(bytes) bytes FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY json_extract(identity,'$.dev'),json_extract(identity,'$.ino'))",params!["scan",project],|r|r.get(0)).unwrap();
+            let files: i64 = db.query_row("SELECT count(*) FROM entries WHERE scan=? AND project=? AND directory=0",params!["scan",project],|r|r.get(0)).unwrap();
+            assert_eq!((actual.0,actual.1),(expected,files));
+            let mut reference = serde_json::Map::new();
+            let mut stmt = db.prepare("SELECT category,sum(bytes),sum(files) FROM (SELECT category,max(bytes) bytes,count(*) files FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY category,json_extract(identity,'$.dev'),json_extract(identity,'$.ino')) GROUP BY category").unwrap();
+            for row in stmt.query_map(params!["scan",project], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap() {
+                let (kind, bytes, files) = row.unwrap();
+                reference.insert(kind, json!({"bytes":bytes,"files":files}));
+            }
+            assert_eq!(actual.2, json!(reference));
+        }
+    }
 }

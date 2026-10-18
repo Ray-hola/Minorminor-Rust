@@ -11,7 +11,7 @@ use std::{
     },
 };
 static SAMPLES: AtomicUsize = AtomicUsize::new(0);
-fn catalog() -> &'static Value {
+pub(crate) fn catalog() -> &'static Value {
     static CATALOG: OnceLock<Value> = OnceLock::new();
     CATALOG.get_or_init(|| {
         serde_json::from_str(include_str!("../resources/agent-catalog.json"))
@@ -34,7 +34,7 @@ fn excluded(path: &Path) -> bool {
         .contains(&c.as_os_str().to_string_lossy().as_ref())
     })
 }
-fn add(
+pub(crate) fn add(
     db: &Connection,
     scan: &str,
     path: &Path,
@@ -48,7 +48,29 @@ fn add(
         params![scan, p, name],
         |r| r.get(0),
     )?;
-    if !exists {
+    if exists {
+        let previous: String = db.query_row(
+            "SELECT evidence FROM tools WHERE scan=? AND path=? AND name=?",
+            params![scan, p, name],
+            |r| r.get(0),
+        )?;
+        let mut proof: Value = serde_json::from_str(&previous)?;
+        let mut sources = proof["sources"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![proof.clone()]);
+        if !sources.contains(&evidence) && sources.len() < 32 {
+            sources.push(evidence.clone());
+        }
+        if evidence["confidence"] == "high" {
+            let sources = sources.clone();
+            proof = evidence.clone();
+            proof["sources"] = json!(sources);
+        } else {
+            proof["sources"] = json!(sources);
+        }
+        db.execute("UPDATE tools SET evidence=?,uncertain=uncertain AND ? WHERE scan=? AND path=? AND name=?",params![proof.to_string(),uncertain,scan,p,name])?;
+    } else {
         db.execute(
             "INSERT INTO tools(scan,id,path,name,evidence,uncertain) VALUES(?,?,?,?,?,?)",
             params![scan, id(), p, name, evidence.to_string(), uncertain],
@@ -194,6 +216,14 @@ fn looks_agent(text: &str) -> bool {
 }
 
 pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
+    finish_with_progress(db, scan_id, home, |_, _, _| Ok(()))
+}
+pub fn finish_with_progress(
+    db: &Connection,
+    scan_id: &str,
+    home: &Path,
+    mut progress: impl FnMut(&Path, usize, usize) -> Result<()>,
+) -> Result<()> {
     let cat = catalog();
     for rule in cat["agentRules"].as_array().unwrap() {
         let name = rule[0].as_str().unwrap();
@@ -260,12 +290,31 @@ pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
             }
         }
     }
-    for base in [PathBuf::from("/Applications"), home.join("Applications")] {
+    let mut application_bases = vec![home.join("Applications")];
+    if dirs::home_dir().as_deref() == Some(home) {
+        application_bases.push(PathBuf::from("/Applications"));
+    }
+    for base in application_bases {
         if let Ok(apps) = fs::read_dir(&base) {
             for app in apps.flatten() {
                 let root = app.path();
                 if root.extension().and_then(|s| s.to_str()) != Some("app") {
                     continue;
+                }
+                if let Some(stem) = root.file_stem().and_then(|s| s.to_str()) {
+                    if let Some(rule) = cat["agentRules"].as_array().unwrap().iter().find(|r| {
+                        r[2].as_array()
+                            .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(stem)))
+                    }) {
+                        add(
+                            db,
+                            scan_id,
+                            &root,
+                            rule[0].as_str().unwrap(),
+                            json!({"type":"application-name","confidence":"medium","installation":true}),
+                            false,
+                        )?;
+                    }
                 }
                 let file = root.join("Contents/Info.plist");
                 if fs::symlink_metadata(&file)
@@ -308,7 +357,8 @@ pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
         })?;
         rows.collect::<std::result::Result<_, _>>()?
     };
-    for (tool, path, _) in &tools {
+    for (i, (tool, path, _)) in tools.iter().enumerate() {
+        progress(path, i, tools.len())?;
         let p = index::path_string(path);
         let lower = format!("{p}/");
         let upper = format!("{p}0");
@@ -321,12 +371,11 @@ pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
     };
     for (path, _tool, _) in &rows {
         let kind = scan::category(Path::new(path), true);
-        db.execute(
-            "UPDATE entries SET category=? WHERE scan=? AND path=?",
-            params![kind, scan_id, path],
-        )?;
+        db.prepare_cached("UPDATE entries SET category=? WHERE scan=? AND path=?")?
+            .execute(params![kind, scan_id, path])?;
     }
-    for (path, tool, _) in &rows {
+    for (i, (path, tool, _)) in rows.iter().enumerate() {
+        progress(Path::new(path), i, rows.len())?;
         let filename = Path::new(path);
         if scan::protected(filename)
             && !["db", "sqlite", "sqlite3"]
@@ -336,26 +385,39 @@ pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
         }
         let kind = scan::category(filename, true);
         let name = filename.file_name().unwrap_or_default().to_string_lossy();
-        let header_candidate =
-            name.ends_with(".jsonl") || name.ends_with(".jsonl.gz") || name.ends_with(".jsonl.zst");
+        let header_candidate = name.ends_with(".jsonl")
+            || name.ends_with(".jsonl.gz")
+            || name.ends_with(".jsonl.zst")
+            || name.ends_with(".ndjson")
+            || name.ends_with(".ndjson.gz")
+            || name.ends_with(".ndjson.zst");
         if kind == "session" || header_candidate {
-            if let Ok((bytes, _)) = files::read_prefix(filename, home, 262144, true) {
-                let text = String::from_utf8_lossy(&bytes);
-                let mut references = HashSet::new();
-                let mut title = String::new();
-                for line in text.lines().take(128) {
-                    if let Ok(value) = serde_json::from_str::<Value>(line) {
-                        metadata(&value, &mut references, &mut title, 0);
+            match files::read_prefix(filename, home, 262144, true) {
+                Ok((bytes, _)) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let mut references = HashSet::new();
+                    let mut title = String::new();
+                    for line in text.lines().take(128) {
+                        if let Ok(value) = serde_json::from_str::<Value>(line) {
+                            metadata(&value, &mut references, &mut title, 0);
+                        }
+                    }
+                    if references.len() == 1 {
+                        let cwd = references.into_iter().next().unwrap();
+                        db.execute(
+                            "UPDATE entries SET category='session' WHERE scan=? AND path=?",
+                            params![scan_id, path],
+                        )?;
+                        association(
+                            db, scan_id, filename, filename, &cwd, tool, &title, false, home,
+                            "session",
+                        )?;
                     }
                 }
-                if references.len() == 1 {
-                    let cwd = references.into_iter().next().unwrap();
+                Err(error) => {
                     db.execute(
-                        "UPDATE entries SET category='session' WHERE scan=? AND path=?",
-                        params![scan_id, path],
-                    )?;
-                    association(
-                        db, scan_id, filename, filename, &cwd, tool, &title, false, home,
+                        "INSERT INTO errors(scan,path,code,reason) VALUES(?,?,?,?)",
+                        params![scan_id, path, "SESSION_READ_ERROR", error.to_string()],
                     )?;
                 }
             }
@@ -373,7 +435,8 @@ pub fn finish(db: &Connection, scan_id: &str, home: &Path) -> Result<()> {
     }
     // Memory in a session's own subdirectory can share that project's association.
     // Never infer ownership from the whole tool root or an ambiguous container.
-    for (path, tool, _) in &rows {
+    for (i, (path, tool, _)) in rows.iter().enumerate() {
+        progress(Path::new(path), i, rows.len())?;
         let memory = Path::new(path);
         if scan::category(memory, true) != "memory" {
             continue;
@@ -418,12 +481,19 @@ fn metadata(value: &Value, refs: &mut HashSet<String>, title: &mut String, depth
                 "working_directory",
                 "worktree",
                 "project_path",
+                "project_root",
+                "projectRoot",
+                "workspacePath",
+                "workingDir",
+                "working_dir",
+                "workspace_path",
+                "workdir",
                 "directory",
             ]
             .contains(&key.as_str())
             {
                 if let Some(s) = v.as_str() {
-                    if s.starts_with('/') && s.len() < 4096 {
+                    if (s.starts_with('/') || s.starts_with("file://")) && s.len() < 4096 {
                         refs.insert(s.into());
                     }
                 }
@@ -446,20 +516,22 @@ fn read_database(
     tool: &str,
     home: &Path,
 ) -> Result<()> {
-    // immutable=1 prevents journals, SHM creation, locking and writes to another
-    // application's database. Live WAL rows are deliberately not claimed.
-    let Ok(mut url) = reqwest::Url::from_file_path(path) else {
+    // Live WAL is read from a verified private pair; the source is never opened writable.
+    let snapshot = crate::database::Snapshot::open(path, index_db)?;
+    let Ok(mut url) = reqwest::Url::from_file_path(&snapshot.path) else {
         return Ok(());
     };
-    url.set_query(Some("mode=ro&immutable=1"));
-    let Ok(db) = Connection::open_with_flags(
+    url.set_query(Some(if snapshot.immutable {
+        "mode=ro&immutable=1"
+    } else {
+        "mode=ro"
+    }));
+    let db = Connection::open_with_flags(
         url.as_str(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_URI
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return Ok(());
-    };
+    )?;
     db.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
     let tables: Vec<String> = {
         let mut stmt = db.prepare(
@@ -489,6 +561,10 @@ fn read_database(
                 "working_directory",
                 "working_dir",
                 "project_path",
+                "project_root",
+                "workspace_path",
+                "path",
+                "workspace",
             ]
             .contains(&s.as_str())
         }) else {
@@ -514,14 +590,38 @@ fn read_database(
             ))
         })?;
         for row in rows.flatten() {
-            if row.0.starts_with('/') {
-                let file = if row.2.starts_with('/') {
+            if row.0.starts_with('/') || row.0.starts_with("file://") {
+                let file = if row.2.starts_with("file://") {
+                    reqwest::Url::parse(&row.2)
+                        .ok()
+                        .and_then(|u| u.to_file_path().ok())
+                        .unwrap_or_else(|| path.to_owned())
+                } else if row.2.starts_with('/') {
                     PathBuf::from(&row.2)
+                } else if !row.2.is_empty()
+                    && !Path::new(&row.2)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    path.parent().unwrap_or(home).join(&row.2)
                 } else {
-                    path.to_path_buf()
+                    path.to_owned()
                 };
                 association(
-                    index_db, scan, path, &file, &row.0, tool, &row.1, true, home,
+                    index_db,
+                    scan,
+                    path,
+                    &file,
+                    &row.0,
+                    tool,
+                    &row.1,
+                    true,
+                    home,
+                    if table.to_lowercase().contains("project") {
+                        "workspace"
+                    } else {
+                        "session"
+                    },
                 )?;
             }
         }
@@ -538,7 +638,18 @@ fn association(
     title: &str,
     managed: bool,
     home: &Path,
+    kind: &str,
 ) -> Result<()> {
+    let converted = if cwd.starts_with("file://") {
+        reqwest::Url::parse(cwd)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .map(|p| index::path_string(&p))
+            .unwrap_or_else(|| cwd.to_owned())
+    } else {
+        cwd.to_owned()
+    };
+    let cwd = converted.as_str();
     let directory = Path::new(cwd);
     if !directory.starts_with(home) || directory == home {
         return Ok(());
@@ -550,7 +661,12 @@ fn association(
             |r| r.get(0),
         )
         .optional()?;
-    let project = if let Some(id) = existing {
+    let nearest: Option<String> = if directory.is_dir() {
+        db.query_row("SELECT id FROM projects WHERE scan=? AND markers<>'[]' AND (path=? OR substr(?,1,length(path)+1)=path||'/') ORDER BY length(path) DESC LIMIT 1",params![scan,cwd,cwd],|r|r.get(0)).optional()?
+    } else {
+        None
+    };
+    let project = if let Some(id) = nearest.or(existing) {
         id
     } else {
         let pid = id();
@@ -569,7 +685,7 @@ fn association(
     let mut actual = physical.to_path_buf();
     let mut status = "readable";
     let mut reason = if managed {
-        "数据库管理的记录，保留；快照未包含正在写入的 WAL"
+        "数据库管理的记录，保留；如有WAL则读取独立的一致性副本"
     } else {
         "会话头中的显式工作目录"
     };
@@ -602,21 +718,64 @@ fn association(
                 reason = "匹配多个文件，未猜测归属";
             }
         }
-    } else if let Err(error) = fs::File::open(physical) {
-        status = if error.kind() == std::io::ErrorKind::PermissionDenied {
-            "permission"
-        } else {
-            "error"
-        };
-        reason = "关联文件无法读取";
     }
-    db.execute("INSERT INTO associations(scan,id,path,indexed_path,project,tool,kind,title,status,reason,managed) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![scan,id(),index::path_string(&actual),index::path_string(physical),project,tool,"session",files::redact(title).chars().take(200).collect::<String>(),status,reason,managed])?;
+    if ["readable", "recovered"].contains(&status) {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        match fs::symlink_metadata(&actual) {
+            Ok(m)
+                if m.is_file()
+                    && !m.file_type().is_symlink()
+                    && m.dev() == fs::metadata(home)?.dev()
+                    && fs::canonicalize(&actual).ok().as_ref() == Some(&actual) =>
+            {
+                if let Err(error) = fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&actual)
+                {
+                    status = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        "permission"
+                    } else {
+                        "error"
+                    };
+                    reason = "关联文件无法读取";
+                }
+            }
+            Ok(_) => {
+                status = "unsafe";
+                reason = "关联文件为链接、特殊文件或跨卷路径，保留";
+            }
+            Err(error) => {
+                status = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    "permission"
+                } else {
+                    "missing"
+                };
+                reason = "关联路径已失效或受限";
+            }
+        }
+    }
+    db.execute("INSERT INTO associations(scan,id,path,indexed_path,project,tool,kind,title,status,reason,managed) VALUES(?,?,?,?,?,?,?,?,?,?,?)",params![scan,id(),index::path_string(&actual),index::path_string(physical),project,tool,kind,files::redact(title).chars().take(200).collect::<String>(),status,reason,managed])?;
     let _ = source;
     Ok(())
 }
 
 pub fn tools(db: &Connection, scan: &str) -> Result<Value> {
     let mut stmt=db.prepare("SELECT t.id,t.name,t.path,t.evidence,t.uncertain,coalesce(sum(CASE WHEN e.directory=0 THEN e.unique_bytes ELSE 0 END),0),coalesce(sum(CASE WHEN e.directory=0 THEN 1 ELSE 0 END),0) FROM tools t LEFT JOIN entries e ON e.scan=t.scan AND e.tool=t.id WHERE t.scan=? GROUP BY t.id ORDER BY 6 DESC")?;
-    let rows=stmt.query_map([scan],|r|{let evidence:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"path":r.get::<_,String>(2)?,"evidence":serde_json::from_str::<Value>(&evidence).unwrap_or(Value::Null),"uncertain":r.get::<_,bool>(4)?,"bytes":r.get::<_,i64>(5)?,"files":r.get::<_,i64>(6)?}))})?.collect::<std::result::Result<Vec<_>,_>>()?;
+    let mut rows=stmt.query_map([scan],|r|{let evidence:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"path":r.get::<_,String>(2)?,"evidence":serde_json::from_str::<Value>(&evidence).unwrap_or(Value::Null),"uncertain":r.get::<_,bool>(4)?,"bytes":r.get::<_,i64>(5)?,"files":r.get::<_,i64>(6)?}))})?.collect::<std::result::Result<Vec<_>,_>>()?;
+    for row in &mut rows {
+        let mut categories = serde_json::Map::new();
+        let mut stmt=db.prepare("SELECT category,sum(unique_bytes),count(*) FROM entries WHERE scan=? AND tool=? AND directory=0 GROUP BY category")?;
+        for item in stmt.query_map(params![scan, row["id"].as_str().unwrap_or("")], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                json!({"bytes":r.get::<_,i64>(1)?,"files":r.get::<_,i64>(2)?}),
+            ))
+        })? {
+            let (key, value) = item?;
+            categories.insert(key, value);
+        }
+        row["categories"] = json!(categories);
+    }
     Ok(json!({"rows":rows,"sampleLimit":4096,"samples":SAMPLES.load(Ordering::Relaxed)}))
 }

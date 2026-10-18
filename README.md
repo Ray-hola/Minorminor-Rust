@@ -20,8 +20,9 @@
 
 - 后台扫描，同步更新目录大小、文件分类、项目与 AI 工具识别。
 - 展开目录与文件，区分缓存、日志、会话和记忆，查看用途与占用。
-- 勾选范围、逐文件预览、确认移到废纸篓，保留原路径与目标路径记录。
-- 可选 AI 元数据判读；文件或文件夹总结由你点选并确认后发起。
+- 勾选范围、逐文件预览，选择移到废纸篓或明确确认永久删除，保留逐文件记录。
+- 安装信息与目录结构自动发现 AI 工具；可选 AI 分批判读，文件总结由你确认后发起。
+- Mole 可视化清单和整次清理，JSON / CSV 导出及 Web 历史导入。
 
 本仓库独立维护 **Rust Application 版**；[Minorminor Web 版](https://github.com/Ray-hola/Minorminor)使用 Node.js 后端，有各自的启动入口、接口、记录与版本。
 
@@ -43,7 +44,7 @@ cd Minorminor-Rust
 
 ## 清理与 AI
 
-清理仅移动审阅后的文件到废纸篓，保留逐文件记录；Mole 高级命令仅预览。会话和记忆需要另行启用，近期、正在使用、受保护或身份已变化的文件会跳过。
+默认将审阅后的文件移到废纸篓；永久删除和整次 Mole clean 需要单独明确确认。支持 Mole 四种命令预览、按清单勾选缓存与日志、逐文件操作记录。会话和记忆需要另行启用，近期、正在使用、受保护或身份已变化的文件会跳过。
 
 AI 判读只使用经审阅的元数据，文档读取和工具调用权限固定禁用。「AI 总结」只对你点选并确认的范围抽读。模型不能自动勾选或执行清理。
 
@@ -59,18 +60,20 @@ AI 判读只使用经审阅的元数据，文档读取和工具调用权限固�
 ```sh
 cargo test --locked --manifest-path native/Cargo.toml --no-default-features
 ./scripts/build-macos.sh
+node --test native/tests/progress.test.mjs
 python3 scripts/test-native-smoke.py
+python3 scripts/test-native-parity.py
 ```
 
-构建生成 `dist/Minorminor.app`，最后一项使用 Python 3 验证打包应用。GitHub Actions 在 macOS 上运行相同测试、打包与冒烟验证，构建产物可从 [Actions](https://github.com/Ray-hola/Minorminor-Rust/actions) 获取；它们不等于正式 Release 安装包。
+构建生成 `dist/Minorminor.app`，两项 Python 3 测试验证打包应用。GitHub Actions 在 macOS 上运行相同测试、打包与冒烟验证，构建产物可从 [Actions](https://github.com/Ray-hola/Minorminor-Rust/actions) 获取；它们不等于正式 Release 安装包。
 
-修改功能时同步相关测试与双语说明；发布与版本各自在本仓库维护。反馈入口：[Issues](https://github.com/Ray-hola/Minorminor-Rust/issues)。
+功能迁移与逐项验证见 [验证清单](docs/native-parity.md)，提交与同步遵循 [维护约定](docs/desktop.md#贡献与同步)。修改功能时同步相关测试与双语说明；发布与版本各自在本仓库维护。反馈入口：[Issues](https://github.com/Ray-hola/Minorminor-Rust/issues)。
 
 ## 上游、许可与致谢
 
 Minorminor Rust Application 采用 [GNU GPL-3.0](LICENSE)（`GPL-3.0-only`）。IBM Plex 字体保留 [SIL Open Font License 1.1](public/fonts/OFL.txt)。
 
-本项目将 **Mole 作为 Git 子模块**引入 `vendor/mole/`，提供部分清理预览与路径保护能力。
+本项目将 **Mole 作为 Git 子模块**引入 `vendor/mole/`，提供清理预览、整次 clean 执行与路径保护能力。
 
 - **Mole 项目网址：[https://github.com/tw93/Mole](https://github.com/tw93/Mole)**
 - 固定提交与来源：[UPSTREAM.json](UPSTREAM.json)。上游代码保持原样，保留其 [GPL-3.0 许可证](https://github.com/tw93/Mole/blob/6650d0958282aa8052cd2bfeee15f67b17fe613b/LICENSE)与版权信息。

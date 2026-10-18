@@ -73,8 +73,15 @@ impl Config {
         } else if let Some(key) = value["apiKey"].as_str().filter(|s| !s.is_empty()) {
             key.to_owned()
         } else {
-            old.api_key.clone()
+            if provider == old.provider && base_url == old.base_url {
+                old.api_key.clone()
+            } else {
+                String::new()
+            }
         };
+        if api_key.len() > 4096 || api_key.contains(['\r', '\n']) {
+            return Err(fail("API Key 无效"));
+        }
         Ok(Self {
             provider,
             base_url,
@@ -150,7 +157,7 @@ mod permission_tests {
         ));
     }
 }
-pub fn request(config: &Config, system: &str, payload: &Value) -> Result<Value> {
+pub(crate) fn request(config: &Config, system: &str, payload: &Value) -> Result<Value> {
     if config.model.is_empty() {
         return Err(fail("请先连接模型"));
     }
@@ -265,6 +272,14 @@ fn document(path: &Path, bytes: Vec<u8>) -> Result<String> {
     }
 }
 pub fn prepare(resource: Resource, home: &Path, revision: u64) -> Result<Prepared> {
+    prepare_excluding(resource, home, revision, &[])
+}
+pub fn prepare_excluding(
+    resource: Resource,
+    home: &Path,
+    revision: u64,
+    excluded: &[PathBuf],
+) -> Result<Prepared> {
     if !resource.path.starts_with(home) {
         return Err(fail("AI 总结仅支持当前用户目录中点选的内容"));
     }
@@ -284,6 +299,10 @@ pub fn prepare(resource: Resource, home: &Path, revision: u64) -> Result<Prepare
             break;
         }
         entries += 1;
+        if excluded.iter().any(|root| path.starts_with(root)) {
+            skipped += 1;
+            continue;
+        }
         let m = match index::checked(&path, &resource.path, resource.identity.dev) {
             Ok(m) => m,
             Err(_) => {
@@ -451,12 +470,29 @@ pub fn analyze(config: &Config, payload: &Value) -> Result<Value> {
     )
 }
 pub fn ollama_models() -> Result<Value> {
-    let response = response_json(client(3)?.get("http://127.0.0.1:11434/api/tags").send()?)?;
+    ollama_models_from("http://127.0.0.1:11434")
+}
+pub fn ollama_models_from(base: &str) -> Result<Value> {
+    let config = Config::validate(
+        &json!({"provider":"ollama","baseUrl":base}),
+        &Config::default(),
+    )?;
+    let response = response_json(
+        client(3)?
+            .get(format!("{}/api/tags", config.base_url))
+            .send()?,
+    )?;
     let models = response["models"]
         .as_array()
         .ok_or_else(|| fail("Ollama 模型列表格式无效"))?;
+    let running = client(3)?
+        .get(format!("{}/api/ps", config.base_url))
+        .send()
+        .ok()
+        .and_then(|r| response_json(r).ok());
+    let active = running.as_ref().and_then(|r| r["models"].as_array());
     Ok(
-        json!({"createdAt":now(),"models":models.iter().filter(|m|m["name"].as_str().is_some_and(|s|s.len()<256)&&m["digest"].is_string()).map(|m|json!({"id":id(),"name":m["name"],"digest":m["digest"],"bytes":m["size"]})).collect::<Vec<_>>()}),
+        json!({"createdAt":now(),"endpoint":config.base_url,"models":models.iter().filter(|m|m["name"].as_str().is_some_and(|s|s.len()<256)&&m["digest"].is_string()).map(|m|json!({"id":id(),"name":m["name"],"digest":m["digest"],"bytes":m["size"],"details":m["details"],"modifiedAt":m["modified_at"],"running":active.map(|rows|rows.iter().any(|r|r["name"]==m["name"]||r["digest"]==m["digest"]))})).collect::<Vec<_>>()}),
     )
 }
 pub fn delete_model(snapshot: &Value, model_id: &str) -> Result<Value> {
@@ -469,7 +505,14 @@ pub fn delete_model(snapshot: &Value, model_id: &str) -> Result<Value> {
         .as_array()
         .and_then(|r| r.iter().find(|m| m["id"] == model_id))
         .ok_or_else(|| fail("模型不属于当前快照"))?;
-    let current = ollama_models()?;
+    let base = snapshot["endpoint"]
+        .as_str()
+        .unwrap_or("http://127.0.0.1:11434");
+    let _ = Config::validate(
+        &json!({"provider":"ollama","baseUrl":base}),
+        &Config::default(),
+    )?;
+    let current = ollama_models_from(base)?;
     if !current["models"]
         .as_array()
         .unwrap()
@@ -479,7 +522,7 @@ pub fn delete_model(snapshot: &Value, model_id: &str) -> Result<Value> {
         return Err(fail("模型身份已变化，请重新核对"));
     }
     let http = client(30)?;
-    let running = response_json(http.get("http://127.0.0.1:11434/api/ps").send()?)?;
+    let running = response_json(http.get(format!("{base}/api/ps")).send()?)?;
     if running["models"]
         .as_array()
         .ok_or_else(|| fail("无法确认模型运行状态"))?
@@ -489,13 +532,13 @@ pub fn delete_model(snapshot: &Value, model_id: &str) -> Result<Value> {
         return Err(fail("模型正在使用，保留"));
     }
     let response = http
-        .delete("http://127.0.0.1:11434/api/delete")
+        .delete(format!("{base}/api/delete"))
         .json(&json!({"model":selected["name"]}))
         .send()?;
     if !response.status().is_success() {
         return Err(fail("Ollama 未确认移除模型"));
     }
-    let after = ollama_models()?;
+    let after = ollama_models_from(base)?;
     if after["models"]
         .as_array()
         .unwrap()

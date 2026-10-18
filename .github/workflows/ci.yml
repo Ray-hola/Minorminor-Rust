@@ -29,10 +29,14 @@ jobs:
           uname -m
       - name: Core tests
         run: cargo test --locked --manifest-path native/Cargo.toml --no-default-features
+      - name: Progress UI tests
+        run: node --test native/tests/progress.test.mjs
       - name: Build application
         run: ./scripts/build-macos.sh
       - name: Packaged application smoke test
-        run: python3 scripts/test-native-smoke.py
+        run: |
+          python3 scripts/test-native-smoke.py
+          python3 scripts/test-native-parity.py
       - name: Package application
         run: ditto -c -k --keepParent dist/Minorminor.app dist/Minorminor-macos.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
