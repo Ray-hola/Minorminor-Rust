@@ -1,0 +1,53 @@
+[package]
+name = "minorminor"
+version = "0.2.0"
+description = "Minorminor Rust Application, a local macOS disk manager"
+license = "GPL-3.0-only"
+repository = "https://github.com/Ray-hola/Minorminor-Rust"
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "minorminor_core"
+path = "src/lib.rs"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:wry", "dep:tao", "dep:muda"]
+
+[dependencies]
+wry = { version = "0.57", default-features = false, features = ["os-webview"], optional = true }
+tao = { version = "0.37", optional = true }
+muda = { version = "0.17", optional = true }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rust-embed = "8"
+dirs = "6"
+flate2 = "1"
+zstd = { version = "0.13", default-features = false }
+plist = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = false
+codegen-units = 8
+opt-level = "s"
+strip = true
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

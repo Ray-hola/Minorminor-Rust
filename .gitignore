@@ -1,0 +1,9 @@
+/native/target/
+/dist/
+/.runtime/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/

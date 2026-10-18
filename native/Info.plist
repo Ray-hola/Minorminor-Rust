@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Minorminor</string>
+  <key>CFBundleDisplayName</key><string>Minorminor</string>
+  <key>CFBundleIdentifier</key><string>com.minorminor.desktop</string>
+  <key>CFBundleExecutable</key><string>Minorminor</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>CFBundleIconFile</key><string>Minorminor.icns</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSDesktopFolderUsageDescription</key><string>扫描桌面上的项目和文件占用；清理前由你预览并确认。</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>扫描文稿目录的文件占用；AI 总结仅在点选并确认后读取内容。</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>扫描下载文件的占用，并保存你主动导出的整理记录。</string>
+  <key>NSRemovableVolumesUsageDescription</key><string>读取你选择扫描的磁盘文件信息和占用。</string>
+</dict></plist>

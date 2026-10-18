@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Minorminor · 对折的「- -」：一张印着「- -」的纸卡，右半边沿中线向后折过去一个角度。
+       左半正对、受光；右半透视变窄、背光；纸卡在深雾灰底上留一道硬投影。 -->
+  <rect width="64" height="64" rx="3" fill="#3A4047"/>
+  <!-- 硬投影 -->
+  <path d="M13 19h22l20 3.5v25L35 51H13Z" fill="#23262A"/>
+  <!-- 左半：正面 -->
+  <path d="M10 16h22v32H10Z" fill="#F7F5F0"/>
+  <!-- 右半：折向后方 -->
+  <path d="M32 16 52 19.5v25L32 48Z" fill="#C3BEB2"/>
+  <!-- 折痕 -->
+  <path d="M32 16v32" stroke="#8C877C" stroke-width="1"/>
+  <!-- 「- -」 -->
+  <rect x="15" y="29" width="12" height="6" fill="#2A2C2F"/>
+  <path d="M37 29.16 49 29.56v4.88l-12 .4Z" fill="#4A4D51"/>
+</svg>

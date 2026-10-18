@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/tw93/Mole",
+  "commit": "6650d0958282aa8052cd2bfeee15f67b17fe613b",
+  "branch": "main",
+  "version": "1.60.0",
+  "license": "GPL-3.0",
+  "copiedOn": "2026-10-16",
+  "method": "git submodule",
+  "trackedFiles": 306,
+  "upstreamModified": false,
+  "path": "vendor/mole"
+}
