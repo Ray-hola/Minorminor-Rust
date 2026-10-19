@@ -687,10 +687,16 @@ pub fn installations(db: &Connection, scan: &str, home: &Path) -> Result<()> {
     installations_with_progress(db, scan, home, |_| Ok(()))
 }
 
-const INSTALLATION_PATHS: &str = "SELECT path FROM entries WHERE scan=? AND directory=0 AND (name IN ('package.json','app.asar','Info.plist','METADATA','PKG-INFO') OR parent LIKE '%/bin') ORDER BY rowid";
+const INSTALLATION_PATHS: &str =
+    "SELECT path FROM entries WHERE scan=? AND directory=0 AND installation=1 ORDER BY path";
 
 fn installation_paths(db: &Connection, scan: &str) -> Result<Vec<String>> {
-    let mut stmt = db.prepare(INSTALLATION_PATHS)?;
+    let legacy="SELECT path FROM entries WHERE scan=? AND directory=0 AND (name IN ('package.json','app.asar','Info.plist','METADATA','PKG-INFO') OR parent LIKE '%/bin') ORDER BY path";
+    let mut stmt = db.prepare(if crate::compact::is_legacy(db)? {
+        legacy
+    } else {
+        INSTALLATION_PATHS
+    })?;
     let rows = stmt.query_map([scan], |r| r.get(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -700,7 +706,7 @@ mod installation_tests {
     use super::*;
 
     #[test]
-    fn candidate_index_preserves_every_matching_path_and_traversal_order() {
+    fn candidate_index_preserves_every_matching_path_in_path_order() {
         let temp = tempfile::tempdir().unwrap();
         let path = index::initialize(temp.path()).unwrap();
         let db = index::connect(&path).unwrap();
@@ -723,7 +729,7 @@ mod installation_tests {
         for i in 0..5000 {
             db.prepare_cached("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category) VALUES('scan',?,'/data',?,0,0,0,0,'{}','other')").unwrap().execute(params![format!("/data/{i}.bin"),format!("{i}.bin")]).unwrap();
         }
-        db.execute_batch("COMMIT").unwrap();
+        db.execute_batch("COMMIT; ANALYZE").unwrap();
         let expected = {
             let sql =
                 INSTALLATION_PATHS.replace("FROM entries WHERE", "FROM entries NOT INDEXED WHERE");

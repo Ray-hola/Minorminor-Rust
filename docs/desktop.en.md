@@ -1,12 +1,14 @@
 # Desktop app
 
-The interface follows Tempo’s warm paper (`#F5F1E8`), brown ink and terracotta accent (`#B5532F`). It uses the same system monospace stack as Tempo: SF Mono / Menlo with PingFang SC for Chinese, without online font loading.
+The interface follows Tempo’s warm paper (`#F5F3EF`), brown ink and terracotta accent (`#B5532F`). It uses the same system monospace stack as Tempo: SF Mono / Menlo with PingFang SC for Chinese, without online font loading.
 
 The app icon, sidebar mark and loading mark share `public/icon.svg`; the macOS build exports PNG and ICNS automatically to keep their colors consistent.
 
 ICNS resource names include a content hash, and the build refreshes application registration so Finder and Dock can pick up icon updates instead of retaining stale artwork.
 
 [Project home](../README.en.md) · [简体中文](desktop.md)
+
+Project cleanup has one shared list with an optional “With AI records” filter. Old AI-project links redirect to this filter. Changing the filter clears selections and previews so hidden projects cannot be cleaned accidentally.
 
 ## Requirements
 
@@ -63,7 +65,7 @@ The benchmark checks every file, directory and logical size, then compares stora
 
 Local release benchmark on 2026-10-19: 61,204 files, 2,007 directories and 1,200 session associations, alternating three runs per binary on the same fixture. Median time fell from 18.754 s to 2.158 s (about 8.7×), with identical indexes across all six runs. These are local fixture measurements; actual times depend on storage, cloud directories and permissions, and do not imply the same speedup on every Mac.
 
-The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. The [v0.2.0 preview](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0) provides an Apple Silicon build; no universal binary or notarized installer is available.
+The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. The [v0.2.1 preview](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.1) provides an Apple Silicon build; no universal binary or notarized installer is available.
 
 UI translations live in `public/locales/en.js`. Use `tr` / `ui` for authored text; interpolate file paths and content unchanged instead of translating the whole DOM.
 
@@ -107,3 +109,15 @@ Ray-hola maintains scope, merges and releases. Run the checks above when changin
 Before pushing, inspect the diff, remote and branch. Exclude `.runtime/`, `dist/`, `native/target/`, secrets and personal scan data. Keep the pinned Mole revision and `UPSTREAM.json` aligned. Read back the remote commit and its Actions run after pushing. Formal releases require separate version, change notes and signing checks; Actions artifacts are not notarized installers. Restore shared changes with `git revert <commit>` rather than rewriting published history.
 
 Reports should include macOS version, chip architecture, reproduction steps and error codes, with private paths and content removed. Never attach raw scan databases or API keys to a public issue.
+
+## File access and index storage
+
+The background combines off-white, warm light gray and ivory paper tones with a faint local fiber texture and subtle shading; terracotta accents remain on actions and selection. No remote assets are loaded.
+
+The first scan offers a centralized permission guide with the running app path, Full Disk Access settings and the app's Finder location. macOS requires the user to grant the permission. Dismissing the guide never claims permission was granted; the app does not read TCC databases or toggle system permissions. Source launch builds and opens the fixed app bundle; a GUI instance lock prevents duplicate launches from resetting scans. Ordinary restarts of the same build and path can reuse system grants. Ad-hoc rebuilds or moves may still require reauthorization; stable Developer ID signing is not provided.
+
+Index writes check free space on the data volume and reserve 256 MiB. Low space stops the scan without publishing partial results as complete. Project assignments use batches of at most 2,000 rows to limit WAL growth. Scan completion, failure and startup recovery reclaim obsolete snapshots while keeping the latest complete result, settings and cleanup receipts.
+
+Settings and low-space errors offer index recovery and storage details. Reusable database pages are distinct from released disk space. New databases can return free pages incrementally. A separately confirmed index rebuild removes rebuildable scan caches and compacts the database while preserving settings, receipts and user files. Very low space, concurrent disk use and long-lived readers can still prevent maintenance; WAL files are never deleted to pretend space was reclaimed.
+
+The compact index stores each scan identifier and parent directory once and uses integer references. All eight file identity fields are packed losslessly, including full paths, nanosecond timestamps and hard-link metadata. Legacy records migrate in checked batches before an atomic schema switch; interruption leaves the complete snapshot available for retry. Settings → Optimize index reclaims obsolete scans and, when scratch space permits, publishes a verified compact database while retaining settings and receipts. Insufficient space is reported. New databases reclaim unused pages incrementally. Optimization does not narrow traversal or delete user files.

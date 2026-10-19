@@ -27,3 +27,8 @@ pub mod measure;
 pub mod project_info;
 pub mod reports;
 pub mod review;
+
+pub mod access;
+pub mod storage;
+
+pub mod compact;

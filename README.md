@@ -3,7 +3,7 @@
 <p align="center"><strong>看清占用，再决定清理。</strong><br />独立的 macOS 桌面应用：Rust 后端，WebKit 窗口，逐文件预览与确认。</p>
 
 <p align="center">
-  <a href="native/Cargo.toml"><img src="assets/readme/badges/version.svg" alt="开发预览 0.2.0" /></a>
+  <a href="native/Cargo.toml"><img src="assets/readme/badges/version.svg" alt="开发预览 0.2.1" /></a>
   <a href="docs/desktop.md#运行要求"><img src="assets/readme/badges/macos.svg" alt="macOS 12 或更新版本" /></a>
   <a href="native/Cargo.toml"><img src="assets/readme/badges/rust.svg" alt="源码构建需要 Rust 1.88 或更新版本" /></a>
   <a href="LICENSE"><img src="assets/readme/badges/license.svg" alt="GPL-3.0 许可证" /></a>
@@ -28,7 +28,7 @@
 
 ## 开始使用
 
-**[下载 v0.2.0 预览版 · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.0/Minorminor-v0.2.0-macos-arm64.zip)**。解压后将 `Minorminor.app` 拖入「应用程序」。仅 ad-hoc 签名，尚未公证；[发布说明与校验值](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.0)。
+**[下载 v0.2.1 预览版 · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.1/Minorminor-v0.2.1-macos-arm64.zip)**。解压后将 `Minorminor.app` 拖入「应用程序」。仅 ad-hoc 签名，尚未公证；[发布说明与校验值](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.1)。
 
 源码运行需要 **macOS 12+、Git、Rust 1.88+ 和 Xcode Command Line Tools**。
 
@@ -42,7 +42,7 @@ cd Minorminor-Rust
 
 **扫描 → 展开查看 → 勾选范围 → 预览并确认。** 侧栏可切换简体中文 / English；文件名、路径、内容和模型回复保留原文。
 
-当前为 **v0.2.0 开发预览**。运行要求、权限与记录位置见 [使用说明](docs/desktop.md)；本机构建仅做 ad-hoc 签名，未经过 Apple Developer ID 签名或公证。
+当前为 **v0.2.1 开发预览**。运行要求、权限与记录位置见 [使用说明](docs/desktop.md)；本机构建仅做 ad-hoc 签名，未经过 Apple Developer ID 签名或公证。
 
 ## 清理与 AI
 

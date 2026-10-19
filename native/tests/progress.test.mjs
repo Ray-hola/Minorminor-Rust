@@ -67,3 +67,10 @@ test('running work and a stopped newer scan take precedence over old completed r
   const stopped={id:'stopped',kind:'scan',status:'cancelled'};assert.equal(progressJob({scan,jobs:[stopped]}),stopped);
   assert.equal(progressJob({jobs:[],scan:null}),null);
 });
+
+test('low index volume preserves the failure and exposes recovery without claiming completion',()=>{
+  const p=scanProgress({kind:'scan',status:'failed',createdAt,error:'索引磁盘空间不足：剩余 20 MB，需保留 256 MB。',stats:{stage:'projects',bytes:1000,estimatedBytes:1000}});
+  assert.equal(p.spaceLimited,true);assert.match(p.error,/回收临时索引/);assert.notEqual(p.fraction,1);
+  const recovering=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'index-recovery'}});
+  assert.ok(recovering.fraction>=.99&&recovering.fraction<1);
+});

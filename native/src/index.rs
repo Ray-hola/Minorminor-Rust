@@ -44,7 +44,10 @@ pub fn secure_directory(path: &Path) -> Result<()> {
 pub fn connect(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
     db.busy_timeout(std::time::Duration::from_secs(10))?;
-    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+    if db.query_row("PRAGMA page_count", [], |r| r.get::<_, u64>(0))? == 0 {
+        db.execute_batch("PRAGMA auto_vacuum=INCREMENTAL")?;
+    }
+    db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=512; PRAGMA journal_size_limit=8388608; PRAGMA cache_size=-16384;")?;
     Ok(db)
 }
 pub fn initialize(data: &Path) -> Result<PathBuf> {
@@ -59,12 +62,6 @@ pub fn initialize(data: &Path) -> Result<PathBuf> {
     let db = connect(&path)?;
     db.execute_batch("
       CREATE TABLE IF NOT EXISTS scans(id TEXT PRIMARY KEY, root TEXT NOT NULL, created TEXT NOT NULL, status TEXT NOT NULL, stats TEXT NOT NULL DEFAULT '{}');
-      CREATE TABLE IF NOT EXISTS entries(scan TEXT NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, name TEXT NOT NULL, directory INTEGER NOT NULL,
-        bytes INTEGER NOT NULL, logical INTEGER NOT NULL, unique_bytes INTEGER NOT NULL, files INTEGER NOT NULL DEFAULT 0, dirs INTEGER NOT NULL DEFAULT 0,
-        identity TEXT NOT NULL, category TEXT NOT NULL, project TEXT, tool TEXT, skipped INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(scan,path));
-      CREATE INDEX IF NOT EXISTS entries_parent ON entries(scan,parent);
-      CREATE INDEX IF NOT EXISTS entries_project ON entries(scan,project,category);
-      CREATE INDEX IF NOT EXISTS entries_tool ON entries(scan,tool);
       CREATE TABLE IF NOT EXISTS projects(scan TEXT NOT NULL,id TEXT NOT NULL,path TEXT NOT NULL,name TEXT NOT NULL,markers TEXT NOT NULL, PRIMARY KEY(scan,id));
       CREATE TABLE IF NOT EXISTS tools(scan TEXT NOT NULL,id TEXT NOT NULL,path TEXT NOT NULL,name TEXT NOT NULL,evidence TEXT NOT NULL, uncertain INTEGER NOT NULL, PRIMARY KEY(scan,id));
       CREATE TABLE IF NOT EXISTS associations(scan TEXT NOT NULL,id TEXT NOT NULL,path TEXT NOT NULL,indexed_path TEXT NOT NULL,project TEXT,tool TEXT NOT NULL,kind TEXT NOT NULL,title TEXT NOT NULL,status TEXT NOT NULL,reason TEXT NOT NULL,managed INTEGER NOT NULL, PRIMARY KEY(scan,id));
@@ -76,6 +73,7 @@ pub fn initialize(data: &Path) -> Result<PathBuf> {
       CREATE TABLE IF NOT EXISTS receipts(job TEXT NOT NULL,created TEXT NOT NULL,path TEXT NOT NULL,target TEXT,status TEXT NOT NULL,bytes INTEGER NOT NULL,reason TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
     ")?;
+    crate::compact::initialize(&db)?;
     let has_skipped: bool = {
         let mut stmt = db.prepare("PRAGMA table_info(entries)")?;
         let columns = stmt
@@ -115,6 +113,9 @@ pub fn prepare_scan_indexes(
     db: &Connection,
     mut progress: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    if !crate::compact::is_legacy(db)? {
+        return crate::compact::indexes(db, progress);
+    }
     // Migrate large indexes in the visible scan worker, not before its window opens.
     for (name, sql) in [
         ("installations", "CREATE INDEX IF NOT EXISTS entries_installations ON entries(scan,path) WHERE directory=0 AND (name IN ('package.json','app.asar','Info.plist','METADATA','PKG-INFO') OR parent LIKE '%/bin')"),
@@ -156,10 +157,11 @@ mod scan_index_tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(built.len(), 4);
+        assert_eq!(built.len(), 7);
+        db.execute_batch("ANALYZE").unwrap();
         for (index, query, count) in [
             ("entries_memory", "SELECT path,tool FROM entries WHERE scan=? AND directory=0 AND category='memory' AND tool IS NOT NULL", 1),
-            ("entries_directories", "SELECT path FROM entries WHERE scan=? AND directory=1 ORDER BY path DESC", 4),
+            ("entries_directories", crate::compact::DIRECTORIES, 4),
             ("entries_hardlinks", "SELECT path,identity,bytes FROM entries WHERE scan=? AND directory=0 AND json_extract(identity,'$.nlink')>1", 2),
         ] {
             let read = |sql: &str| {
@@ -168,7 +170,7 @@ mod scan_index_tests {
                 rows.collect::<std::result::Result<Vec<_>,_>>().unwrap()
             };
             let mut actual = read(query);
-            let mut expected = read(&query.replace("FROM entries WHERE", "FROM entries NOT INDEXED WHERE"));
+            let mut expected = read(&query.replace("FROM entries WHERE", "FROM entries NOT INDEXED WHERE").replace("INDEXED BY entries_directories", "NOT INDEXED"));
             assert_eq!(actual.len(),count);
             actual.sort();expected.sort();assert_eq!(actual,expected);
             let mut stmt = db.prepare(&format!("EXPLAIN QUERY PLAN {query}")).unwrap();
@@ -191,7 +193,12 @@ pub fn prune_with_progress(
     for table in ["entries", "projects", "tools", "associations", "errors"] {
         progress(table, removed)?;
         loop {
-            let changed=db.execute(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE scan IN (SELECT id FROM scans WHERE id<>?) LIMIT 1000)"),[&keep])?;
+            let changed = if table == "entries" && !crate::compact::is_legacy(db)? {
+                db.execute("DELETE FROM _entries WHERE (scan,path) IN (SELECT e.scan,e.path FROM _entries e JOIN entry_scans s ON s.id=e.scan WHERE s.value IN (SELECT id FROM scans WHERE id<>?) LIMIT 1000)",[&keep])?
+            } else {
+                db.execute(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE scan IN (SELECT id FROM scans WHERE id<>?) LIMIT 1000)"),[&keep])?
+            };
+            crate::storage::checkpoint(db)?;
             removed += changed as u64;
             progress(table, removed)?;
             if changed < 1000 {
@@ -200,6 +207,9 @@ pub fn prune_with_progress(
         }
     }
     db.execute("DELETE FROM scans WHERE id<>?", [&keep])?;
+    if !crate::compact::is_legacy(db)? {
+        crate::compact::prune_directories(db, &mut progress, removed)?;
+    }
     db.execute("DELETE FROM plan_files", [])?;
     db.execute("DELETE FROM plans", [])?;
     Ok(())

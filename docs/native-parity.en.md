@@ -28,13 +28,17 @@ The local Web implementation is the reference for scanning, cleanup, project ana
 
 Apple Silicon macOS:
 
-- **53 Rust tests passed**: 19 parity, 19 safety, 5 review, 5 progress and 5 unit tests.
-- **12 progress UI tests passed**.
+- **62 Rust tests passed**: 19 parity, 19 safety, 5 review, 5 progress and 5 unit tests, plus 6 storage/access and 3 compact-index regressions.
+- **13 progress UI tests passed**.
 - Packaged application smoke test passed, including real worker processes, cancellation under a write lock, pinned Mole protection, Trash receipts, rescans and persisted language.
-- **13 packaged parity workflows passed** with local mock AI / Ollama services: AI batches and cache, permission refusal, selected summaries, diagnostics, history import, exports, protected model removal, four Mole previews, selected cleanup, whole cleanup, cancellation receipts and restart invalidation.
+- **15 packaged parity workflows passed** with local mock AI / Ollama services: AI batches and cache, permission refusal, selected summaries, diagnostics, history import, exports, protected model removal, four Mole previews, selected cleanup, whole cleanup, cancellation receipts and restart invalidation.
 - Native macOS / WebKit window checked: scan status, project categories, folder sizes, 130-file paginated previews, remeasurement, summary preview and result, candidate metadata, AI advice, association diagnostics, Mole plans and confirmation controls, and bilingual navigation.
 - Release `.app` build and ad-hoc signature verification passed. Sources: [`native/tests/`](../native/tests/), [`test-native-smoke.py`](../scripts/test-native-smoke.py), [`test-native-parity.py`](../scripts/test-native-parity.py). CI runs the same checks.
 
 Cleanup, permanent deletion and model removal used disposable fixtures and local mock services only. These checks do not guarantee every Mac, unknown harness or cloud provider will be identified correctly. Intel, real stalled cloud providers and actual model downloads / removal have not been verified on hardware. macOS access permissions, mounts and filesystem state still apply and are reported in results and diagnostics.
 
 Estimated progress now captures total and available space before every scan, preferring complete same-scope history over volume used space. Post-traversal stages reserve progress; only successful completion reaches 100%. Cancellation or failure never fakes completion.
+
+Index regressions cover interrupted legacy migration, per-record field equality, unsigned 64-bit identity values, hard-link indexing, indexed parent lookup, cross-snapshot mutation isolation, verified compact publication and physical page reclamation. Fixtures use temporary directories only.
+
+- v0.2.1 UI verification passed: merged project entry, all / AI-record filters, selection and preview invalidation, selected-project-only previews, legacy `#ai` redirects and Chinese/English labels.

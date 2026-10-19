@@ -13,7 +13,7 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
   const isScan = job.kind === 'scan';
   let fraction = stageFraction;
   if (isScan) {
-    const ranges = { preparing: [0, 0], disk: [0, .90], projects: [.90, .04], storage: [.94, .04], 'harness-analysis': [.98, .01], models: [.99, 0] };
+    const ranges = { preparing: [0, 0], disk: [0, .90], projects: [.90, .04], storage: [.94, .04], 'harness-analysis': [.98, .01], models: [.99, 0], 'index-recovery': [.99, .005] };
     const range = ranges[stage];
     if (status === 'complete') fraction = 1;
     else if (range) {
@@ -23,12 +23,13 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
   }
   return {
     stage, status, stats, elapsedMs, idleMs,
+    spaceLimited: status === 'failed' && /database or disk is full|disk full|no space left|索引磁盘空间不足/i.test(job.error || ''),
     step: status === 'complete' ? 4 : Math.max(0, stages.indexOf(stage) + 1),
     steps: 4,
     fraction, stageFraction, estimated: isScan && status !== 'complete' && fraction != null,
     waiting: status === 'running' && idleMs >= 8000,
-    error: status !== 'failed' ? '' : /database or disk is full|disk full|no space left/i.test(job.error || '')
-      ? '磁盘空间不足，无法写入扫描索引。腾出空间后重试。' : job.error || '',
+    error: status !== 'failed' ? '' : /database or disk is full|disk full|no space left|索引磁盘空间不足/i.test(job.error || '')
+      ? '磁盘空间不足。可先回收临时索引，或重建索引后重试。' : job.error || '',
   };
 }
 

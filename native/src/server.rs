@@ -19,7 +19,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU16, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread,
 };
@@ -36,6 +36,7 @@ pub struct Engine {
     pub port: AtomicU16,
     pub files: files::Resources,
     inner: Mutex<Inner>,
+    db_gate: RwLock<()>,
 }
 struct Inner {
     jobs: VecDeque<Value>,
@@ -75,6 +76,7 @@ impl Engine {
             token: format!("{}{}", crate::id(), crate::id()),
             port: AtomicU16::new(0),
             files: files::Resources::default(),
+            db_gate: RwLock::new(()),
             inner: Mutex::new(Inner {
                 jobs,
                 active: None,
@@ -131,14 +133,43 @@ impl Engine {
         }
         Ok((id, cancel))
     }
-    fn finish(&self, id: &str, result: Result<Value>, cancelled: bool) {
+    fn finish(&self, id: &str, mut result: Result<Value>, cancelled: bool) {
+        if cancelled || result.is_err() {
+            crate::storage::discard_repack(&self.data);
+        }
+        if !cancelled && result.as_ref().is_ok_and(|v| v["repackReady"] == true) {
+            let _exclusive = self.db_gate.write().unwrap();
+            match crate::storage::install_repack(&self.data) {
+                Ok(after) => {
+                    if let Ok(value) = &mut result {
+                        value["after"] = after;
+                        value["repackReady"] = json!(false);
+                    }
+                }
+                Err(error) => {
+                    crate::storage::discard_repack(&self.data);
+                    if let Ok(value) = &mut result {
+                        value["compactionWarning"] = json!(error.to_string());
+                    }
+                }
+            }
+        }
         let models = result
             .as_ref()
             .ok()
             .filter(|v| v.get("models").is_some())
             .cloned();
+        let reset = result.as_ref().is_ok_and(|r| r["reset"] == true);
+        if reset {
+            self.files.issued.lock().unwrap().clear();
+        }
         let saved = {
             let mut state = self.inner.lock().unwrap();
+            if reset {
+                state.previews.clear();
+                state.models = Value::Null;
+                state.jobs.retain(|j| j["id"] == id);
+            }
             if let Some(models) = &models {
                 state.models = models.clone();
             }
@@ -153,6 +184,7 @@ impl Engine {
             saved
         };
         // Disk pressure must not block progress, cancellation or status reads.
+        let _persistence = self.db_gate.read().unwrap();
         if let Ok(db) = index::connect(&self.db) {
             if let Some(models) = models {
                 let _ = index::save_setting(&db, "models-snapshot", &models);
@@ -244,7 +276,11 @@ impl Engine {
         let _ = writer.join();
         let errors = errors.join().unwrap_or_default();
         if cancel.load(Ordering::SeqCst) {
-            return Err(fail("任务已停止；已发生的移动请查看逐文件记录"));
+            return Err(fail(if payload["action"] == "index-recover" {
+                "索引优化已停止；已有扫描结果保留"
+            } else {
+                "任务已停止；已发生的移动请查看逐文件记录"
+            }));
         }
         let value = outcome.ok_or_else(|| {
             fail(if errors.trim().is_empty() {
@@ -284,8 +320,15 @@ impl Engine {
         let job_id = id.clone();
         let kind = kind.to_owned();
         thread::spawn(move || {
+            if kind == "index-recover" {
+                let _drain = engine.db_gate.write().unwrap();
+            }
             let result = engine.worker(&job_id, payload, &cancel);
             let cancelled = cancel.load(Ordering::SeqCst);
+            if kind == "scan" && result.is_err() && !cancelled {
+                let cleanup = json!({"action":"index-recover","reset":false,"home":engine.home,"data":engine.data,"resources":*engine.resources.lock().unwrap(),"jobId":job_id,"parentPid":std::process::id()});
+                let _ = engine.worker(&job_id, cleanup, &cancel);
+            }
             engine.finish(&job_id, result, cancelled);
             if kind == "scan" && cancelled {
                 if let Ok(db) = index::connect(&engine.db) {
@@ -294,6 +337,25 @@ impl Engine {
             }
         });
         Ok(json!({"id":id,"stats":initial_stats}))
+    }
+    pub fn recover_index_if_needed(self: &Arc<Self>) -> Result<()> {
+        let db = index::connect(&self.db)?;
+        let keep = index::latest(&db)?.unwrap_or_default();
+        let stale: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scans WHERE id<>?)",
+            [keep],
+            |r| r.get(0),
+        )?;
+        let optimize = crate::compact::is_legacy(&db)?
+            || (db.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))? != 2
+                && db.query_row("PRAGMA freelist_count", [], |r| r.get::<_, u64>(0))? > 256);
+        if (stale || optimize) && !self.running() {
+            self.background(
+                "index-recover",
+                json!({"action":"index-recover","reset":false}),
+            )?;
+        }
+        Ok(())
     }
     pub fn dispatch(self: &Arc<Self>, action: &str, body: Value) -> Result<Value> {
         if action == "jobs" {
@@ -320,6 +382,19 @@ impl Engine {
             self.cancel();
             return Ok(json!({"ok":true}));
         }
+        let _database = self.db_gate.read().unwrap();
+        let maintenance = {
+            let state = self.inner.lock().unwrap();
+            state.active.as_ref().is_some_and(|id| {
+                state
+                    .jobs
+                    .iter()
+                    .any(|j| j["id"] == *id && j["kind"] == "index-recover")
+            })
+        };
+        if maintenance && !["bootstrap", "storage/info", "access/status"].contains(&action) {
+            return Err(fail("正在优化扫描索引，请完成或停止后再操作"));
+        }
         if action == "scan" {
             let disk = body["scope"].as_str() == Some("disk");
             let root = if disk && Path::new("/System/Volumes/Data").is_dir() {
@@ -335,6 +410,16 @@ impl Engine {
             };
             let capacity = disk_status(&root)?;
             return self.background("scan", json!({"action":"scan","root":root,"disk":disk,"diskSnapshot":capacity,"ollamaBase":if config.provider=="ollama"{config.base_url.clone()}else{"http://127.0.0.1:11434".into()},"harnessConfig":if enabled&&!config.model.is_empty(){private_config(&config)}else{Value::Null}}));
+        }
+        if action == "storage/recover" {
+            let reset = body["reset"] == true;
+            if reset && body["confirmation"] != "REBUILD_SCAN_INDEX" {
+                return Err(fail("请确认重建扫描索引"));
+            }
+            return self.background(
+                "index-recover",
+                json!({"action":"index-recover","reset":reset}),
+            );
         }
         let mut db = index::connect(&self.db)?;
         let latest = index::latest(&db)?;
@@ -536,9 +621,15 @@ impl Engine {
                     .transpose()?;
                 let stale = index::setting(&db, "dirty")?.is_some_and(|v| !v.is_null());
                 Ok(
-                    json!({"token":self.token,"preferences":index::setting(&db,"ui-preferences")?.unwrap_or_else(||json!({})),"native":true,"version":"0.2.0","home":self.home,"disk":disk_status(&self.home)?,"scan":scan_info,"stale":stale,"jobs":state.jobs,"config":state.config.public(state.revision),"models":state.models,"mole":mole::metadata(&self.resources.lock().unwrap()),"lastReceipt":index::setting(&db,"last-receipt")?,"molePreview":index::setting(&db,"mole-preview")?,"advice":index::setting(&db,"ai-advice")?,"harnessAnalysis":index::setting(&db,"harness-enabled")?.unwrap_or(json!(false)),"legacy":index::setting(&db,"legacy-import")?.map(|v|json!({"createdAt":v["createdAt"],"stale":true}))}),
+                    json!({"token":self.token,"preferences":index::setting(&db,"ui-preferences")?.unwrap_or_else(||json!({})),"native":true,"version":env!("CARGO_PKG_VERSION"),"access":crate::access::status(&db)?,"indexStorage":crate::storage::status(&db)?,"home":self.home,"disk":disk_status(&self.home)?,"scan":scan_info,"stale":stale,"jobs":state.jobs,"config":state.config.public(state.revision),"models":state.models,"mole":mole::metadata(&self.resources.lock().unwrap()),"lastReceipt":index::setting(&db,"last-receipt")?,"molePreview":index::setting(&db,"mole-preview")?,"advice":index::setting(&db,"ai-advice")?,"harnessAnalysis":index::setting(&db,"harness-enabled")?.unwrap_or(json!(false)),"legacy":index::setting(&db,"legacy-import")?.map(|v|json!({"createdAt":v["createdAt"],"stale":true}))}),
                 )
             }
+            "access/status" => crate::access::status(&db),
+            "access/acknowledge" => {
+                crate::access::acknowledge(&db)?;
+                crate::access::status(&db)
+            }
+            "storage/info" => crate::storage::status(&db),
             "preferences" => {
                 if !["zh-CN", "en"].contains(&body["locale"].as_str().unwrap_or(""))
                     || body.as_object().is_none_or(|v| v.len() != 1)
@@ -731,6 +822,9 @@ impl Engine {
                 if body["confirmation"] != "SEND_METADATA_FOR_ADVICE" {
                     return Err(fail("请先审阅将要发送的元数据"));
                 }
+                // Avoid recursively taking the reader lock while maintenance waits.
+                drop(db);
+                drop(_database);
                 let payload = self.dispatch("ai/payload", json!({"scanId":scan}))?;
                 if payload["revision"] != body["revision"] || payload["scanId"] != body["scanId"] {
                     return Err(fail("扫描或模型连接已变化，请重新核对"));
@@ -761,10 +855,7 @@ impl Engine {
             }
             "export" => self.export(&db, &body, scan.as_deref()),
             "privacy" => {
-                #[cfg(target_os = "macos")]
-                {
-                    Command::new("/usr/bin/open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles").spawn()?;
-                }
+                crate::access::open_settings()?;
                 Ok(json!({"ok":true}))
             }
             _ => Err(fail("此接口不存在")),
@@ -810,7 +901,40 @@ pub fn worker(payload: Value) -> Result<()> {
     let job = payload["jobId"]
         .as_str()
         .ok_or_else(|| fail("缺少任务 ID"))?;
+    let mut recovery_progress = std::time::Instant::now();
     let result = match payload["action"].as_str().unwrap_or("") {
+        "index-recover" => {
+            let db = index::connect(&data.join("index.sqlite3"))?;
+            let mut result = crate::storage::recover(
+                &db,
+                payload["reset"] == true,
+                |table, removed| {
+                    if recovery_progress.elapsed().as_millis() >= 250 || removed == 0 {
+                        println!(
+                            "{}",
+                            json!({"event":"progress","stats":{"stage":"index-recovery","removed":if table=="compact"{0}else{removed},"indexTable":table,"currentPath":data.join("index.sqlite3")}})
+                        );
+                        std::io::stdout().flush()?;
+                        recovery_progress = std::time::Instant::now();
+                    }
+                    Ok(())
+                },
+            )?;
+            if payload["reset"] != true {
+                match crate::storage::prepare_repack(&db, |table, removed| {
+                    println!(
+                        "{}",
+                        json!({"event":"progress","stats":{"stage":"index-recovery","indexTable":table,"removed":removed}})
+                    );
+                    std::io::stdout().flush()?;
+                    Ok(())
+                }) {
+                    Ok(ready) => result["repackReady"] = json!(ready),
+                    Err(error) => result["compactionWarning"] = json!(error.to_string()),
+                }
+            }
+            result
+        }
         "scan" => {
             let db = index::connect(&data.join("index.sqlite3"))?;
             let estimate = scan_estimate(
@@ -854,6 +978,20 @@ pub fn worker(payload: Value) -> Result<()> {
             index::save_setting(&db, "dirty", &Value::Null)?;
             db.execute("UPDATE scans SET status='complete' WHERE id=?", [job])?;
             db.execute_batch("COMMIT")?;
+            let recovery = crate::storage::recover(&db, false, |table, removed| {
+                if recovery_progress.elapsed().as_millis() >= 250 || removed == 0 {
+                    println!(
+                        "{}",
+                        json!({"event":"progress","stats":{"stage":"index-recovery","removed":if table=="compact"{0}else{removed},"indexTable":table,"currentPath":data.join("index.sqlite3")}})
+                    );
+                    std::io::stdout().flush()?;
+                    recovery_progress = std::time::Instant::now();
+                }
+                Ok(())
+            });
+            if let Err(error) = recovery {
+                models["indexWarning"] = json!(error.to_string());
+            }
             models
         }
         "summary" => ai::summary(

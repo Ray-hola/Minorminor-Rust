@@ -56,6 +56,20 @@ async fn run() -> Result<()> {
         .ok_or_else(|| fail("无法取得用户目录"))?;
     let data = argument(&args, "--data")
         .unwrap_or_else(|| home.join("Library/Application Support/com.minorminor.desktop"));
+    let _instance = match minorminor_core::access::instance_lock(&data)? {
+        Some(lock) => lock,
+        None => {
+            if args.iter().any(|s| s == "--headless") {
+                return Err(fail("该数据目录已由另一个 Minorminor 实例使用"));
+            }
+            if let Some(app) = minorminor_core::access::bundle() {
+                let _ = std::process::Command::new("/usr/bin/open")
+                    .arg(app)
+                    .status();
+            }
+            return Ok(());
+        }
+    };
     let resources = argument(&args, "--resources").unwrap_or_else(|| {
         let binary = std::env::current_exe().ok();
         let bundled = binary.and_then(|p| {
@@ -98,6 +112,7 @@ async fn run() -> Result<()> {
         engine.cancel();
         return Ok(());
     }
+    let _ = engine.recover_index_if_needed();
     #[cfg(feature = "desktop")]
     {
         use muda::{Menu, PredefinedMenuItem, Submenu};

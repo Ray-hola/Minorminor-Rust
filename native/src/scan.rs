@@ -298,11 +298,12 @@ fn error(db: &Connection, scan: &str, path: &Path, e: &io::Error, stats: &mut St
         params![scan, index::path_string(path), code, reason],
     )?;
     let target = index::path_string(path);
-    let changed = db.execute(
+    let before = db.total_changes();
+    db.execute(
         "UPDATE entries SET skipped=skipped+1 WHERE scan=? AND path=? AND directory=1",
         params![scan, target],
     )?;
-    if changed == 0 {
+    if db.total_changes() == before {
         if let Some(parent) = path.parent() {
             db.execute(
                 "UPDATE entries SET skipped=skipped+1 WHERE scan=? AND path=? AND directory=1",
@@ -330,6 +331,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
     {
         return Err(fail("扫描入口含符号链接或不是目录"));
     }
+    crate::storage::guard(&db)?;
     let mut pruning = Instant::now();
     index::prune_with_progress(&db, |table, removed| {
         if removed == 0 || pruning.elapsed().as_millis() >= 250 {
@@ -499,7 +501,9 @@ pub fn run(spec: ScanSpec) -> Result<()> {
             )?;
             count += 1;
             if count % 1000 == 0 {
-                db.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
+                db.execute_batch("COMMIT")?;
+                crate::storage::guard(&db)?;
+                db.execute_batch("BEGIN IMMEDIATE")?;
             }
             if published.elapsed().as_millis() > 250 {
                 stats.elapsed_ms = started.elapsed().as_millis();
@@ -511,12 +515,15 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         extra.observe(&db, &spec.id, &path, &names, &spec.home)?;
     }
     db.execute_batch("COMMIT")?;
+    crate::storage::guard(&db)?;
     stats.stage = "projects".into();
     stats.elapsed_ms = started.elapsed().as_millis();
     emit(&stats)?;
+    db.execute_batch("PRAGMA optimize=0x10002")?;
     extra.finish(&db, &spec.id)?;
     crate::discovery_extra::installations_with_progress(&db, &spec.id, &spec.home, |path| {
         if published.elapsed().as_millis() >= 250 {
+            crate::storage::guard(&db)?;
             println!(
                 "{}",
                 json!({"event":"progress","stats":{"stage":"projects","currentPath":path}})
@@ -552,6 +559,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
     })?;
     crate::project_info::enrich_with_progress(&db, &spec.id, &spec.home, |path| {
         if published.elapsed().as_millis() >= 250 {
+            crate::storage::guard(&db)?;
             println!(
                 "{}",
                 json!({"event":"progress","stats":{"stage":"projects","currentPath":path,"completed":0,"total":0}})
@@ -574,6 +582,7 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         })?;
         mapped.collect::<std::result::Result<_, _>>()?
     };
+    db.execute_batch("COMMIT")?;
     for (i, (project, path)) in roots.iter().enumerate() {
         if i == 0 || published.elapsed().as_millis() >= 250 {
             println!(
@@ -585,20 +594,38 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         }
         let prefix = format!("{}/", path.display());
         let upper = format!("{}0", path.display());
-        db.execute(
-            "UPDATE entries SET project=? WHERE scan=? AND project IS NULL AND path>=? AND path<?",
-            params![project, spec.id, prefix, upper],
-        )?;
+        loop {
+            crate::storage::guard(&db)?;
+            let before = db.total_changes();
+            db.execute(
+                "UPDATE entries SET project=?1 WHERE scan=?2 AND path IN (SELECT path FROM entries WHERE scan=?2 AND project IS NULL AND path>=?3 AND path<?4 LIMIT 2000)",
+                params![project, spec.id, prefix, upper],
+            )?;
+            if published.elapsed().as_millis() >= 250 {
+                println!(
+                    "{}",
+                    json!({"event":"progress","stats":{"stage":"projects","currentPath":path,"completed":i,"total":roots.len()}})
+                );
+                io::stdout().flush()?;
+                published = Instant::now();
+            }
+            if db.total_changes() - before < 2000 {
+                break;
+            }
+        }
     }
     assign_associated_projects(&db, &spec.id)?;
-    db.execute_batch("COMMIT")?;
     stats.stage = "storage".into();
     emit(&stats)?;
     // Descending binary paths put every descendant before its ancestor. The
     // directory index supplies this order without sorting a million long paths.
     let dirs: Vec<String> = {
-        let mut stmt =
-            db.prepare("SELECT path FROM entries WHERE scan=? AND directory=1 ORDER BY path DESC")?;
+        let sql = if crate::compact::is_legacy(&db)? {
+            "SELECT path FROM entries WHERE scan=? AND directory=1 ORDER BY path DESC"
+        } else {
+            crate::compact::DIRECTORIES
+        };
+        let mut stmt = db.prepare(sql)?;
         let rows = stmt.query_map([&spec.id], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
@@ -607,7 +634,9 @@ pub fn run(spec: ScanSpec) -> Result<()> {
         let (bytes,logical,unique,files,children,skipped):(i64,i64,i64,i64,i64,i64)=db.prepare_cached("SELECT coalesce(sum(bytes),0),coalesce(sum(logical),0),coalesce(sum(unique_bytes),0),coalesce(sum(files),0),coalesce(sum(dirs+directory),0),coalesce(sum(skipped),0) FROM entries WHERE scan=? AND parent=? AND path<>?")?.query_row(params![spec.id,path,path],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
         db.prepare_cached("UPDATE entries SET bytes=?,logical=?,unique_bytes=?,files=?,dirs=?,skipped=skipped+? WHERE scan=? AND path=?")?.execute(params![bytes,logical,unique,files,children,skipped,spec.id,path])?;
         if i % 1000 == 0 {
-            db.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
+            db.execute_batch("COMMIT")?;
+            crate::storage::guard(&db)?;
+            db.execute_batch("BEGIN IMMEDIATE")?;
         }
         if i == 0 || published.elapsed().as_millis() >= 250 || i + 1 == dirs.len() {
             stats.current_path = path.clone();

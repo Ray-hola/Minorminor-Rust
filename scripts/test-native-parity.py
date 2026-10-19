@@ -181,6 +181,58 @@ fi
         assert not api('bootstrap')['config']['hasKey'] and api('history')['total']>=2
         assert not any(b'PRIVATE_TRANSCRIPT' in p.read_bytes() for p in data.glob('index.sqlite3*'))
         passed('restart retains audit history, clears execution authority and keeps document bodies out of the index')
+        storage=api('storage/info',{});assert storage['bytes']>0 and storage['reserveBytes']>0 and storage['incremental']
+        access=api('access/status',{});assert access['authorization']=='system-managed'
+        api('access/acknowledge',{});assert api('access/status',{})['setupShown']
+        snapshot=api('bootstrap')['scan']['id'];history=api('history')['total']
+        # Inject a persistent SQLite write failure after the worker has started.
+        # The real parent's failure path must reclaim partial rows and retain the snapshot.
+        with sqlite3.connect(data/'index.sqlite3') as fault:
+            fault.execute("CREATE TRIGGER fixture_full BEFORE INSERT ON _entries WHEN NEW.name='trace.jsonl' BEGIN SELECT RAISE(ABORT,'database or disk is full'); END")
+        fault.close()
+        wait(api('scan',{'scope':'home'}),'failed')
+        assert api('bootstrap')['scan']['id']==snapshot
+        with sqlite3.connect(data/'index.sqlite3') as fault:
+            assert fault.execute('SELECT count(*) FROM scans').fetchone()[0]==1
+            assert fault.execute('SELECT count(DISTINCT scan) FROM entries').fetchone()[0]==1
+            fault.execute('DROP TRIGGER fixture_full')
+        fault.close()
+        wait(api('storage/recover',{}));assert api('bootstrap')['scan']['id']==snapshot
+        # Reopen an old row-store through the packaged worker, including its
+        # verified physical publication in the parent and reconnect afterward.
+        fault.close()
+        stop()
+        with sqlite3.connect(data/'index.sqlite3') as legacy:
+            legacy.execute('CREATE TABLE entries_legacy AS SELECT scan,path,parent,name,directory,bytes,logical,unique_bytes,files,dirs,identity,category,project,tool,skipped FROM entries')
+            legacy.execute('DROP VIEW entries');legacy.execute('DROP TABLE _entries')
+            legacy.execute('DROP TABLE entry_parents');legacy.execute('DROP TABLE entry_scans')
+            legacy.execute('ALTER TABLE entries_legacy RENAME TO entries')
+            legacy.execute('CREATE UNIQUE INDEX entries_legacy_key ON entries(scan,path)')
+            legacy.execute('PRAGMA auto_vacuum=NONE');legacy.commit();legacy.execute('VACUUM')
+            legacy.execute('CREATE TABLE padding(value TEXT)')
+            legacy.executemany('INSERT INTO padding VALUES(?)',[('synthetic padding '*250,)]*1500);legacy.commit()
+            legacy.execute('DROP TABLE padding');legacy.commit()
+            legacy.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        legacy.close()
+        launch()
+        before=api('storage/info',{});assert not before['compactLayout'] and not before['incremental']
+        migration=api('storage/recover',{})
+        running=next(j for j in api('jobs')['jobs'] if j['id']==migration['id'])
+        if running['status']=='running':rejected('preferences',{'locale':'zh'})
+        result,_=wait(migration)
+        assert not result.get('compactionWarning'),result
+        after=api('storage/info',{});assert after['compactLayout'] and after['incremental'] and after['bytes']<before['bytes']
+        assert api('bootstrap')['scan']['id']==snapshot and api('history')['total']==history
+        assert api('access/status',{})['setupShown'] and keep.exists()
+        assert api('projects',{'scanId':snapshot})['rows']
+        passed('legacy index migrates and physically shrinks through the packaged parent while preserving the complete snapshot and settings')
+        root=api('files',{'scanId':snapshot})
+        rejected('storage/recover',{'reset':True})
+        wait(api('storage/recover',{'reset':True,'confirmation':'REBUILD_SCAN_INDEX'}))
+        assert api('bootstrap')['scan'] is None and api('history')['total']==history
+        assert api('access/status',{})['setupShown']
+        rejected('files',{'scanId':snapshot});assert keep.exists()
+        passed('index recovery and explicit rebuild preserve documents, preferences and cleanup history; permission guidance never grants access')
         print(f'PASS: {len(checks)} packaged parity workflows',flush=True)
     finally:
         if process and process.poll() is None:stop()

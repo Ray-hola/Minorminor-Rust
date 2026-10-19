@@ -198,3 +198,7 @@ dialog .native-plan-row>label{display:flex;align-items:center;gap:8px}
 .native-scan-report.is-complete{border-left:3px solid var(--ok)}
 .native-scan-report.is-complete strong,.native-scan-report.is-complete>span>svg{color:var(--ok-ink)}
 .cleanup-action-summary strong{color:var(--accent-strong)}
+
+.native-recovery-actions{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.mm-storage-metrics{margin:16px 0}
+dialog{background-color:var(--surface);background-image:var(--paper-grain),var(--paper-sheet);background-size:192px 192px,100% 100%}
