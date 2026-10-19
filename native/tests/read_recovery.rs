@@ -258,3 +258,47 @@ fn absent_data_volume_alias_is_not_misreported_as_disappearance() {
         .starts_with("/System/Volumes/Data/"));
     assert_eq!(audit[0]["code"], "EPERM");
 }
+
+#[test]
+fn a_readable_file_error_is_recovered_and_updates_file_and_parent_sizes() {
+    let t = tempfile::tempdir().unwrap();
+    let base = t.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let data = base.join("data");
+    let file = home.join("cache/restored.log");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, "old").unwrap();
+    let path = index::initialize(&data).unwrap();
+    scan::run(scan::ScanSpec {
+        id: "s".into(),
+        root: home.clone(),
+        home: home.clone(),
+        data: data.clone(),
+        disk: false,
+        publish: true,
+        index_path: None,
+    })
+    .unwrap();
+    fs::write(&file, "restored log with a new size").unwrap();
+    let mut db = index::connect(&path).unwrap();
+    db.execute(
+        "INSERT INTO errors VALUES('s',?,'EACCES','fixture')",
+        [file.to_str().unwrap()],
+    )
+    .unwrap();
+    let result = read_recovery::run_with(&mut db, "s", &home, &data, cloud::probe_local).unwrap();
+    assert_eq!(result["summary"], json!({"recovered":1}));
+    assert_eq!(result["remaining"], 0);
+    let expected = fs::metadata(&file).unwrap().len();
+    for p in [&file, &home] {
+        assert_eq!(
+            db.query_row(
+                "SELECT logical FROM entries WHERE scan='s' AND path=?",
+                [p.to_str().unwrap()],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}

@@ -99,7 +99,9 @@ pub fn run_with(
             row["originalCode"] = rows[i]["originalCode"].clone();
             row["originalReason"] = rows[i]["originalReason"].clone();
         }
-        let database = ["DB_READ_ERROR", "UNSUPPORTED_DATABASE"].contains(&old_code.as_str());
+        let database = ["DB_READ_ERROR", "UNSUPPORTED_DATABASE"].contains(&old_code.as_str())
+            || ["DB_READ_ERROR", "UNSUPPORTED_DATABASE"]
+                .contains(&row["originalCode"].as_str().unwrap_or(""));
         // The caller supplies a scan ID, never arbitrary filesystem paths.
         let checked = if !path.is_absolute() || !path.starts_with(&scope) {
             Err(std::io::Error::from_raw_os_error(libc::EACCES))
@@ -163,21 +165,43 @@ pub fn run_with(
             let metadata: cloud::Metadata = serde_json::from_value(metadata.clone())?;
             row["uid"] = result["uid"].clone();
             row["mode"] = result["mode"].clone();
-            if metadata.is_dir() && path != scope {
-                let refreshed = if measured.iter().any(|p| path.starts_with(p)) {
+            let mut refresh_path = path.to_owned();
+            let mut refresh_actual = actual.clone();
+            let mut refresh_metadata = metadata.clone();
+            if metadata.is_file()
+                && !database
+                && old_code != "SESSION_READ_ERROR"
+                && row["originalCode"] != "SESSION_READ_ERROR"
+            {
+                row["reason"] = json!("文件可读取，父目录补扫未完成");
+                if let (Some(parent), Some(actual_parent)) = (path.parent(), actual.parent()) {
+                    if parent != scope {
+                        let parent_probe = probe(actual_parent, false).unwrap_or(Value::Null);
+                        if parent_probe["code"].is_null() {
+                            if let Some(value) = parent_probe.get("metadata") {
+                                refresh_metadata = serde_json::from_value(value.clone())?;
+                                refresh_path = parent.into();
+                                refresh_actual = actual_parent.into();
+                            }
+                        }
+                    }
+                }
+            }
+            if refresh_metadata.is_dir() && refresh_path != scope {
+                let refreshed = if measured.iter().any(|p| refresh_path.starts_with(p)) {
                     Ok(json!({"updated":true}))
                 } else {
                     crate::scan::without_progress(|| {
                         crate::measure::run_mapped(
                             db,
                             Resource {
-                                path: actual.clone(),
+                                path: refresh_actual.clone(),
                                 root: scope.clone(),
                                 scan: scan.into(),
-                                identity: metadata.identity,
+                                identity: refresh_metadata.identity,
                                 directory: true,
                             },
-                            path,
+                            &refresh_path,
                             home,
                             data,
                         )
@@ -185,7 +209,7 @@ pub fn run_with(
                 };
                 match refreshed {
                     Ok(_) => {
-                        measured.push(path.into());
+                        measured.push(refresh_path);
                         let remains: bool = db.query_row(
                             "SELECT EXISTS(SELECT 1 FROM errors WHERE scan=? AND path=?)",
                             params![scan, raw],
@@ -246,6 +270,10 @@ pub fn run_with(
             params![scan, raw, old_code],
         )?;
         if !["recovered", "resolved"].contains(&row["status"].as_str().unwrap_or("")) {
+            tx.execute(
+                "DELETE FROM errors WHERE scan=? AND path=? AND code=?",
+                params![scan, raw, row["code"].as_str().unwrap_or(old_code)],
+            )?;
             tx.execute(
                 "INSERT INTO errors(scan,path,code,reason) VALUES(?,?,?,?)",
                 params![

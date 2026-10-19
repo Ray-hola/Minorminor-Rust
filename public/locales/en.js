@@ -1,4 +1,5 @@
 export default Object.freeze({
+  "文件可读取，父目录补扫未完成": "File is readable; parent directory refresh is incomplete",
   "核实并补读": "Check and retry",
   "核实与补读已完成": "Read checks and recovery complete",
   "权限不足": "Access denied",

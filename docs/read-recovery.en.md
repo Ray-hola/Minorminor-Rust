@@ -8,7 +8,7 @@ Completed scans automatically recheck recorded failures. **Read diagnostics → 
 | Missing path | Recheck `ENOENT` / `ENOTDIR` / `ESTALE`; verify the physical Data-volume path and indexed identity before treating an absent root alias as disappearance; retain the original failure and current state. Missing is not reported as a successful read. |
 | Cloud timeout | Cloud directory reads run in isolated processes, with a ten-second idle timeout and one retry. Incomplete reads remain visible; placeholder contents are not deliberately downloaded. |
 | Format mismatch | Check the SQLite header before parsing. Empty files and single absolute-path references are not SQL databases. Unknown formats and corrupt databases remain diagnostics. |
-| Recovered | Fully rescan directories that became readable, atomically updating sizes, categories and error counts without following links or crossing volumes. |
+| Recovered | Fully rescan directories that became readable; refresh a recovered file through its parent directory. Atomically update sizes, categories and error counts without following links or crossing volumes. |
 
 Recovery runs under the App's existing access grants. Filesystem probes have process-level timeout boundaries; the background task can be stopped. Recovery does not elevate privileges, change file permissions or bypass macOS protection. Some system directories remain restricted even with Full Disk Access.
 
