@@ -64,6 +64,7 @@ impl Fixture {
             data: self.data.clone(),
             disk: false,
             publish: true,
+            index_path: None,
         })
         .unwrap();
         id

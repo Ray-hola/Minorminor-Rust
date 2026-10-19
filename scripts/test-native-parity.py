@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise restored desktop workflows against disposable homes and local fake services."""
 import http.server, json, os, pathlib, signal, sqlite3, subprocess, tempfile, threading, time, urllib.error, urllib.request
+from native_index_support import connect_index
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP = pathlib.Path(os.environ.get('MINORMINOR_TEST_BINARY', ROOT / 'dist/Minorminor.app/Contents/MacOS/Minorminor'))
 checks=[]
@@ -179,30 +180,35 @@ fi
         preview,_=wait(api('mole/preview',{'command':'clean'}));stop();launch()
         rejected('mole/execute',{'previewId':preview['id'],'confirmation':'PERMANENT_MOLE_CLEAN'})
         assert not api('bootstrap')['config']['hasKey'] and api('history')['total']>=2
-        assert not any(b'PRIVATE_TRANSCRIPT' in p.read_bytes() for p in data.glob('index.sqlite3*'))
+        assert not any(b'PRIVATE_TRANSCRIPT' in p.read_bytes() for p in [*data.glob('index*.sqlite3*'), *data.glob('user-state.sqlite3*')])
         passed('restart retains audit history, clears execution authority and keeps document bodies out of the index')
         storage=api('storage/info',{});assert storage['bytes']>0 and storage['reserveBytes']>0 and storage['incremental']
         access=api('access/status',{});assert access['authorization']=='system-managed'
         api('access/acknowledge',{});assert api('access/status',{})['setupShown']
         snapshot=api('bootstrap')['scan']['id'];history=api('history')['total']
-        # Inject a persistent SQLite write failure after the worker has started.
-        # The real parent's failure path must reclaim partial rows and retain the snapshot.
-        with sqlite3.connect(data/'index.sqlite3') as fault:
-            fault.execute("CREATE TRIGGER fixture_full BEFORE INSERT ON _entries WHEN NEW.name='trace.jsonl' BEGIN SELECT RAISE(ABORT,'database or disk is full'); END")
-        fault.close()
-        wait(api('scan',{'scope':'home'}),'failed')
+        # A real traversal failure must discard its private work, retaining the
+        # published snapshot. SQLITE_FULL is separately injected into a prepared
+        # private index in native/tests/snapshot.rs.
+        unavailable=base/'temporarily-unavailable-home'
+        state_lock=sqlite3.connect(data/'user-state.sqlite3');state_lock.execute('BEGIN IMMEDIATE')
+        try:
+            failed_scan=api('scan',{'scope':'home'});home.rename(unavailable)
+            state_lock.rollback();state_lock.close()
+            wait(failed_scan,'failed')
+        finally:
+            state_lock.close()
+            if unavailable.exists():unavailable.rename(home)
         assert api('bootstrap')['scan']['id']==snapshot
-        with sqlite3.connect(data/'index.sqlite3') as fault:
+        with connect_index(data/'index-v4.sqlite3') as fault:
             assert fault.execute('SELECT count(*) FROM scans').fetchone()[0]==1
             assert fault.execute('SELECT count(DISTINCT scan) FROM entries').fetchone()[0]==1
-            fault.execute('DROP TRIGGER fixture_full')
         fault.close()
         wait(api('storage/recover',{}));assert api('bootstrap')['scan']['id']==snapshot
         # Reopen an old row-store through the packaged worker, including its
         # verified physical publication in the parent and reconnect afterward.
         fault.close()
         stop()
-        with sqlite3.connect(data/'index.sqlite3') as legacy:
+        with connect_index(data/'index-v4.sqlite3',writable=True) as legacy:
             legacy.execute('CREATE TABLE entries_legacy AS SELECT scan,path,parent,name,directory,bytes,logical,unique_bytes,files,dirs,identity,category,project,tool,skipped FROM entries')
             legacy.execute('DROP VIEW entries');legacy.execute('DROP TABLE _entries')
             legacy.execute('DROP TABLE entry_parents');legacy.execute('DROP TABLE entry_scans')

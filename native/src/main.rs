@@ -106,7 +106,7 @@ async fn run() -> Result<()> {
     if args.iter().any(|s| s == "--headless") {
         println!(
             "{}",
-            json!({"url":url,"version":"0.2.0","backend":"rust","home":engine.home})
+            json!({"url":url,"version":env!("CARGO_PKG_VERSION"),"backend":"rust","home":engine.home})
         );
         tokio::signal::ctrl_c().await?;
         engine.cancel();

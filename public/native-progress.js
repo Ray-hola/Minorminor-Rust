@@ -4,7 +4,9 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
   const stages = ['disk', 'projects', 'storage', 'models'];
   const stage = stats.stage || 'preparing';
   const status = job.status;
-  const elapsedMs = Math.max(0, (Date.parse(job.finishedAt) || now) - (Date.parse(job.createdAt) || now));
+  const measuredElapsed = Number(stats.elapsedMs);
+  const elapsedMs = job.kind === 'scan' && stats.elapsedMs != null && Number.isFinite(measuredElapsed) && measuredElapsed >= 0
+    ? measuredElapsed : Math.max(0, (Date.parse(job.finishedAt) || now) - (Date.parse(job.createdAt) || now));
   const idleMs = Math.max(0, now - (Date.parse(job.progressAt || job.createdAt) || now));
   const total = Number(stats.total) || 0;
   const completed = Number(stats.completed) || 0;
@@ -13,7 +15,7 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
   const isScan = job.kind === 'scan';
   let fraction = stageFraction;
   if (isScan) {
-    const ranges = { preparing: [0, 0], disk: [0, .90], projects: [.90, .04], storage: [.94, .04], 'harness-analysis': [.98, .01], models: [.99, 0], 'index-recovery': [.99, .005] };
+    const ranges = { preparing: [0, 0], disk: [0, .90], projects: [.90, .04], storage: [.94, .04], 'read-recovery': [.98, 0], summaries: [.98, .005], 'harness-analysis': [.985, .005], models: [.99, 0], 'index-recovery': [.99, .005], 'index-compress': [.99, .004], 'index-verify': [.994, .001] };
     const range = ranges[stage];
     if (status === 'complete') fraction = 1;
     else if (range) {
@@ -24,8 +26,8 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
   return {
     stage, status, stats, elapsedMs, idleMs,
     spaceLimited: status === 'failed' && /database or disk is full|disk full|no space left|索引磁盘空间不足/i.test(job.error || ''),
-    step: status === 'complete' ? 4 : Math.max(0, stages.indexOf(stage) + 1),
-    steps: 4,
+    step: status === 'complete' ? 5 : ['summaries','harness-analysis','read-recovery'].includes(stage) ? 3 : ['index-recovery','index-compress','index-verify'].includes(stage) ? 5 : Math.max(0, stages.indexOf(stage) + 1),
+    steps: 5,
     fraction, stageFraction, estimated: isScan && status !== 'complete' && fraction != null,
     waiting: status === 'running' && idleMs >= 8000,
     error: status !== 'failed' ? '' : /database or disk is full|disk full|no space left|索引磁盘空间不足/i.test(job.error || '')
@@ -38,7 +40,8 @@ export function scanProgress(job, now = Date.now(), capacity = null) {
 export function progressJob(boot) {
   const jobs = boot?.jobs || [];
   const existing = jobs.find(j => j.status === 'running') || [...jobs].reverse().find(j => j.kind === 'scan');
-  if (existing) return existing;
+  if (existing) return existing.kind==='scan' && existing.status==='complete' && existing.id===boot?.scan?.id
+    ? {...existing,stats:{...existing.stats,...boot.scan.stats}} : existing;
   const scan = boot?.scan;
   if (scan?.status !== 'complete') return null;
   const started = Date.parse(scan.createdAt);

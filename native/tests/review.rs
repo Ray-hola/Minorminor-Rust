@@ -84,6 +84,7 @@ fn session_header_metadata_links_nonstandard_layouts_and_nearby_memory() {
         data,
         disk: false,
         publish: true,
+        index_path: None,
     })
     .unwrap();
     let db = index::connect(&db_path).unwrap();

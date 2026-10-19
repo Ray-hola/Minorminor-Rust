@@ -1,4 +1,4 @@
-use crate::{files, id, index, scan, Result};
+use crate::{fail, files, id, index, scan, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::{
@@ -362,28 +362,42 @@ pub fn finish_with_progress(
         let p = index::path_string(path);
         let lower = format!("{p}/");
         let upper = format!("{p}0");
-        db.execute("UPDATE entries SET tool=? WHERE scan=? AND tool IS NULL AND (path=? OR (path>=? AND path<?))",params![tool,scan_id,p,lower,upper])?;
+        if crate::compact::is_legacy(db)? || crate::overlay::active(db)? {
+            db.execute("UPDATE entries SET tool=? WHERE scan=? AND tool IS NULL AND (path=? OR (path>=? AND path<?))",params![tool,scan_id,p,lower,upper])?;
+        } else {
+            db.execute("UPDATE _entries SET tool=? WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND path=? AND tool IS NULL",params![tool,scan_id,p])?;
+            db.execute("UPDATE _entries SET tool=? WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND path>=? AND path<? AND tool IS NULL",params![tool,scan_id,lower,upper])?;
+        }
     }
     let rows: Vec<(String, String, String)> = {
-        let mut stmt=db.prepare("SELECT path,tool,category FROM entries WHERE scan=? AND directory=0 AND tool IS NOT NULL")?;
+        let query = if crate::compact::is_legacy(db)? || crate::overlay::active(db)? {
+            "SELECT path,tool,category FROM entries WHERE scan=? AND directory=0 AND tool IS NOT NULL"
+        } else {
+            "SELECT path,tool,category FROM _entries INDEXED BY entries_tool WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND directory=0 AND tool IS NOT NULL"
+        };
+        let mut stmt = db.prepare(query)?;
         let mapped = stmt.query_map([scan_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         mapped.collect::<std::result::Result<_, _>>()?
     };
-    for (path, _tool, _) in &rows {
-        let kind = scan::category(Path::new(path), true);
-        db.prepare_cached("UPDATE entries SET category=? WHERE scan=? AND path=?")?
-            .execute(params![kind, scan_id, path])?;
+    let mut classifier = scan::Classifier::default();
+    for (i, (path, _tool, old)) in rows.iter().enumerate() {
+        progress(Path::new(path), i, rows.len())?;
+        let kind = classifier.category(Path::new(path), true);
+        if kind != old {
+            db.prepare_cached("UPDATE entries SET category=? WHERE scan=? AND path=?")?
+                .execute(params![kind, scan_id, path])?;
+        }
     }
     for (i, (path, tool, _)) in rows.iter().enumerate() {
         progress(Path::new(path), i, rows.len())?;
         let filename = Path::new(path);
-        if scan::protected(filename)
+        if classifier.protected(filename)
             && !["db", "sqlite", "sqlite3"]
                 .contains(&filename.extension().and_then(|s| s.to_str()).unwrap_or(""))
         {
             continue;
         }
-        let kind = scan::category(filename, true);
+        let kind = classifier.category(filename, true);
         let name = filename.file_name().unwrap_or_default().to_string_lossy();
         let header_candidate = name.ends_with(".jsonl")
             || name.ends_with(".jsonl.gz")
@@ -438,7 +452,7 @@ pub fn finish_with_progress(
     for (i, (path, tool, _)) in rows.iter().enumerate() {
         progress(Path::new(path), i, rows.len())?;
         let memory = Path::new(path);
-        if scan::category(memory, true) != "memory" {
+        if classifier.category(memory, true) != "memory" {
             continue;
         }
         let tool_root: Option<&PathBuf> = tools
@@ -509,13 +523,19 @@ fn metadata(value: &Value, refs: &mut HashSet<String>, title: &mut String, depth
         }
     }
 }
-fn read_database(
+pub(crate) fn read_database(
     index_db: &Connection,
     scan: &str,
     path: &Path,
     tool: &str,
     home: &Path,
 ) -> Result<()> {
+    let (header, _) = files::read_prefix(path, home, 4096, false)?;
+    match crate::database::format(&header) {
+        "empty" | "path-reference" => return Ok(()),
+        "sqlite" => {}
+        _ => return Err(fail("文件内容不是 SQLite 数据库")),
+    }
     // Live WAL is read from a verified private pair; the source is never opened writable.
     let snapshot = crate::database::Snapshot::open(path, index_db)?;
     let Ok(mut url) = reqwest::Url::from_file_path(&snapshot.path) else {
@@ -760,12 +780,58 @@ fn association(
     Ok(())
 }
 
+const TOOL_CATEGORY_TOTALS: &str = "SELECT category,sum(unique_bytes),count(*) FROM _entries WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND tool=? AND directory=0 GROUP BY category";
+
+pub fn tool_metadata(db: &Connection, scan: &str) -> Result<Vec<Value>> {
+    let mut stmt = db.prepare("SELECT id,name,path,evidence,uncertain FROM tools WHERE scan=?")?;
+    let rows=stmt.query_map([scan],|r|{let evidence:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"path":r.get::<_,String>(2)?,"evidence":serde_json::from_str::<Value>(&evidence).unwrap_or(Value::Null),"uncertain":r.get::<_,bool>(4)?}))})?.collect::<std::result::Result<Vec<_>,_>>()?;
+    Ok(rows)
+}
+
 pub fn tools(db: &Connection, scan: &str) -> Result<Value> {
-    let mut stmt=db.prepare("SELECT t.id,t.name,t.path,t.evidence,t.uncertain,coalesce(sum(CASE WHEN e.directory=0 THEN e.unique_bytes ELSE 0 END),0),coalesce(sum(CASE WHEN e.directory=0 THEN 1 ELSE 0 END),0) FROM tools t LEFT JOIN entries e ON e.scan=t.scan AND e.tool=t.id WHERE t.scan=? GROUP BY t.id ORDER BY 6 DESC")?;
-    let mut rows=stmt.query_map([scan],|r|{let evidence:String=r.get(3)?;Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"path":r.get::<_,String>(2)?,"evidence":serde_json::from_str::<Value>(&evidence).unwrap_or(Value::Null),"uncertain":r.get::<_,bool>(4)?,"bytes":r.get::<_,i64>(5)?,"files":r.get::<_,i64>(6)?}))})?.collect::<std::result::Result<Vec<_>,_>>()?;
+    // A LEFT JOIN against the compact compatibility view materializes every
+    // indexed entry. Its indexed per-tool category totals already contain both
+    // headline totals, including empty tools and hard-link deduplication.
+    let mut rows = tool_metadata(db, scan)?;
+    let complete = db
+        .query_row(
+            "SELECT status='complete' FROM scans WHERE id=?",
+            [scan],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let revision = index::setting(db, "storage-summary-revision")?
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let category_sql = if crate::compact::is_legacy(db)? || crate::overlay::active(db)? {
+        "SELECT category,sum(unique_bytes),count(*) FROM entries WHERE scan=? AND tool=? AND directory=0 GROUP BY category"
+    } else {
+        TOOL_CATEGORY_TOTALS
+    };
     for row in &mut rows {
+        let cache_key = format!(
+            "tool-storage-cache-{scan}-{}",
+            row["id"].as_str().unwrap_or("")
+        );
+        if complete {
+            if let Some(cache) = index::setting(db, &cache_key)? {
+                if cache["revision"].as_u64() == Some(revision)
+                    && cache["bytes"].is_i64()
+                    && cache["files"].is_i64()
+                    && cache["categories"].is_object()
+                {
+                    for key in ["bytes", "files", "categories"] {
+                        row[key] = cache[key].clone();
+                    }
+                    continue;
+                }
+            }
+        }
         let mut categories = serde_json::Map::new();
-        let mut stmt=db.prepare("SELECT category,sum(unique_bytes),count(*) FROM entries WHERE scan=? AND tool=? AND directory=0 GROUP BY category")?;
+        let mut bytes = 0i64;
+        let mut files = 0i64;
+        let mut stmt = db.prepare_cached(category_sql)?;
         for item in stmt.query_map(params![scan, row["id"].as_str().unwrap_or("")], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -773,9 +839,124 @@ pub fn tools(db: &Connection, scan: &str) -> Result<Value> {
             ))
         })? {
             let (key, value) = item?;
+            bytes += value["bytes"].as_i64().unwrap_or(0);
+            files += value["files"].as_i64().unwrap_or(0);
             categories.insert(key, value);
         }
+        row["bytes"] = json!(bytes);
+        row["files"] = json!(files);
         row["categories"] = json!(categories);
+        if complete {
+            index::save_setting(
+                db,
+                &cache_key,
+                &json!({"bytes":bytes,"files":files,"categories":row["categories"],"revision":revision}),
+            )?;
+        }
     }
+    rows.sort_by(|a, b| {
+        b["bytes"]
+            .as_i64()
+            .cmp(&a["bytes"].as_i64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
     Ok(json!({"rows":rows,"sampleLimit":4096,"samples":SAMPLES.load(Ordering::Relaxed)}))
+}
+
+#[cfg(test)]
+mod tool_storage_tests {
+    use super::*;
+    #[test]
+    fn tool_totals_keep_categories_empty_tools_links_and_scan_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = index::connect(&index::initialize(temp.path()).unwrap()).unwrap();
+        for (id, path) in [
+            ("main", "/fixture/agent"),
+            ("nested", "/fixture/agent/nested"),
+            ("empty", "/fixture/empty"),
+        ] {
+            db.execute("INSERT INTO tools(scan,id,path,name,evidence,uncertain) VALUES('current',?,?,?,'{}',1)",params![id,path,id]).unwrap();
+        }
+        for (scan, path, tool, category, directory, bytes) in [
+            ("current", "/fixture/agent/one", "main", "cache", false, 16),
+            ("current", "/fixture/agent/link", "main", "cache", false, 0),
+            ("current", "/fixture/agent/log", "main", "log", false, 4096),
+            (
+                "current",
+                "/fixture/agent/directory",
+                "main",
+                "cache",
+                true,
+                9999,
+            ),
+            (
+                "current",
+                "/fixture/agent/nested/file",
+                "nested",
+                "memory",
+                false,
+                64,
+            ),
+            (
+                "previous",
+                "/fixture/agent/old",
+                "main",
+                "log",
+                false,
+                999999,
+            ),
+        ] {
+            db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category,tool) VALUES(?,?,'/fixture','file',?,?,0,?,'{}',?,?)",params![scan,path,directory,bytes,bytes,category,tool]).unwrap();
+        }
+        db.execute_batch("BEGIN").unwrap();
+        for n in 0..2000 {
+            db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category) VALUES('current',?,'/unrelated','file',0,32,32,32,'{}','other')",[format!("/unrelated/file-{n}")]).unwrap();
+        }
+        db.execute_batch("COMMIT; ANALYZE").unwrap();
+        db.execute("INSERT INTO scans(id,root,created,status) VALUES('current','/fixture','today','complete')",[]).unwrap();
+        let result = tools(&db, "current").unwrap();
+        let rows = result["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["id"], "main");
+        assert_eq!(rows[0]["bytes"], 4112);
+        assert_eq!(rows[0]["files"], 3);
+        assert_eq!(
+            rows[0]["categories"]["cache"],
+            json!({"bytes":16,"files":2})
+        );
+        assert_eq!(
+            rows[0]["categories"]["log"],
+            json!({"bytes":4096,"files":1})
+        );
+        assert_eq!(rows[1]["bytes"], 64);
+        assert_eq!(rows[1]["files"], 1);
+        assert_eq!(rows[2]["id"], "empty");
+        assert_eq!(rows[2]["bytes"], 0);
+        assert_eq!(rows[2]["categories"], json!({}));
+        assert!(rows.iter().all(|r| r["uncertain"] == true));
+        let plan = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {TOOL_CATEGORY_TOTALS}"))
+            .unwrap()
+            .query_map(params!["current", "main"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|r| r.contains("entries_tool")), "{plan:?}");
+        assert!(!plan.iter().any(|r| r.contains("MATERIALIZE")), "{plan:?}");
+        assert!(index::setting(&db, "tool-storage-cache-current-main")
+            .unwrap()
+            .is_some());
+        db.execute("UPDATE entries SET unique_bytes=128 WHERE scan='current' AND path='/fixture/agent/nested/file'",[]).unwrap();
+        index::invalidate_storage_summaries(&db).unwrap();
+        // A request that finishes late must not restore an older summary.
+        index::save_setting(
+            &db,
+            "tool-storage-cache-current-main",
+            &json!({"bytes":999,"files":1,"categories":{},"revision":0}),
+        )
+        .unwrap();
+        let refreshed = tools(&db, "current").unwrap();
+        assert_eq!(refreshed["rows"][0]["bytes"], 4112);
+        assert_eq!(refreshed["rows"][1]["bytes"], 128);
+    }
 }

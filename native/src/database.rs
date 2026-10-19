@@ -10,6 +10,23 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
+/// A filename suffix is only a candidate; never open lock or pointer metadata as SQL.
+pub fn format(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"SQLite format 3\0") {
+        "sqlite"
+    } else if bytes.is_empty() {
+        "empty"
+    } else if bytes.len() < 4096
+        && std::str::from_utf8(bytes).is_ok_and(|s| {
+            let s = s.trim();
+            s.starts_with('/') && !s.contains(['\n', '\r', '\0'])
+        })
+    {
+        "path-reference"
+    } else {
+        "unknown"
+    }
+}
 pub struct Snapshot {
     pub path: PathBuf,
     pub immutable: bool,

@@ -14,8 +14,7 @@ use std::{
     path::{Path, PathBuf},
 };
 pub fn initialize(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS reviews(id TEXT PRIMARY KEY,created TEXT NOT NULL,expires INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,preview TEXT NOT NULL,groups_json TEXT NOT NULL);CREATE TABLE IF NOT EXISTS review_nodes(plan TEXT NOT NULL,id TEXT NOT NULL,group_id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(plan,id));")?;
-    Ok(())
+    crate::user_state::initialize(db)
 }
 pub fn supported(path: &Path, home: &Path) -> bool {
     if !path.starts_with(home) || path == home || scan::protected(path) {

@@ -63,14 +63,22 @@ pub fn is_cloud(path: &Path) -> bool {
     text.contains("/Library/Mobile Documents") || text.contains("/Library/CloudStorage")
 }
 fn request(path: &Path, mode: &str) -> io::Result<(Vec<Value>, bool)> {
+    request_checked(path, mode, None)
+}
+fn request_checked(
+    path: &Path,
+    mode: &str,
+    expected: Option<&Metadata>,
+) -> io::Result<(Vec<Value>, bool)> {
     let mut child = Command::new(std::env::current_exe()?)
         .arg("--directory-worker")
+        .env("TOKIO_WORKER_THREADS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let mut input = child.stdin.take().unwrap();
-    input.write_all(json!({"path":path,"mode":mode}).to_string().as_bytes())?;
+    input.write_all(json!({"path":path,"mode":mode,"expected":expected.map(|m|json!({"dev":m.dev(),"ino":m.ino()}))}).to_string().as_bytes())?;
     drop(input);
     let (tx, rx) = std::sync::mpsc::sync_channel(128);
     let stdout = child.stdout.take().unwrap();
@@ -113,7 +121,10 @@ pub fn metadata(path: &Path) -> io::Result<Metadata> {
     if !is_cloud(path) || std::env::var_os("MINORMINOR_WORKER").is_none() {
         return fs::symlink_metadata(path).map(|m| Metadata::of(&m));
     }
-    let (rows, timeout) = request(path, "stat")?;
+    let (mut rows, mut timeout) = request(path, "stat")?;
+    if timeout {
+        (rows, timeout) = request(path, "stat")?;
+    }
     if timeout {
         return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
     }
@@ -128,7 +139,30 @@ pub fn metadata(path: &Path) -> io::Result<Metadata> {
     Err(io::Error::other("云文件元数据不可用"))
 }
 pub fn directory(path: &Path) -> io::Result<Vec<io::Result<Entry>>> {
-    let (rows, timeout) = request(path, "list")?;
+    directory_checked(path, None)
+}
+fn directory_checked(
+    path: &Path,
+    expected: Option<&Metadata>,
+) -> io::Result<Vec<io::Result<Entry>>> {
+    let (mut rows, mut timeout) = request_checked(path, "list", expected)?;
+    if timeout {
+        let (retry, incomplete) = request_checked(path, "list", expected)?;
+        if incomplete {
+            let mut known: std::collections::HashSet<String> = rows
+                .iter()
+                .filter_map(|v| v["path"].as_str().map(str::to_owned))
+                .collect();
+            rows.extend(retry.into_iter().filter(|v| {
+                v["path"]
+                    .as_str()
+                    .is_none_or(|p| known.insert(p.to_owned()))
+            }));
+        } else {
+            rows = retry;
+        }
+        timeout = incomplete;
+    }
     let mut entries = Vec::new();
     for row in rows {
         if let (Some(raw), Some(m)) = (row["path"].as_str(), row.get("metadata")) {
@@ -151,20 +185,58 @@ pub fn directory(path: &Path) -> io::Result<Vec<io::Result<Entry>>> {
 pub enum Entry {
     Local(fs::DirEntry),
     Cloud(PathBuf),
+    Bulk(PathBuf, Option<Metadata>),
+    #[cfg(target_os = "macos")]
+    At(PathBuf, crate::directory::Handle),
 }
 impl Entry {
+    pub fn metadata(&self) -> io::Result<Metadata> {
+        match self {
+            Self::Bulk(_, Some(m)) => Ok(m.clone()),
+            #[cfg(target_os = "macos")]
+            Self::At(p, handle) => handle.metadata(p),
+            _ => metadata(&self.path()),
+        }
+    }
+
     pub fn path(&self) -> PathBuf {
         match self {
             Self::Local(e) => e.path(),
-            Self::Cloud(p) => p.clone(),
+            Self::Cloud(p) | Self::Bulk(p, _) => p.clone(),
+            #[cfg(target_os = "macos")]
+            Self::At(p, _) => p.clone(),
         }
     }
     pub fn file_name(&self) -> std::ffi::OsString {
         match self {
             Self::Local(e) => e.file_name(),
-            Self::Cloud(p) => p.file_name().unwrap_or_default().to_os_string(),
+            Self::Cloud(p) | Self::Bulk(p, _) => p.file_name().unwrap_or_default().to_os_string(),
+            #[cfg(target_os = "macos")]
+            Self::At(p, _) => p.file_name().unwrap_or_default().to_os_string(),
         }
     }
+}
+pub fn scan_dir(
+    path: &Path,
+    expected: &Metadata,
+) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>>>> {
+    if is_cloud(path) && std::env::var_os("MINORMINOR_WORKER").is_some() {
+        return Ok(Box::new(
+            directory_checked(path, Some(expected))?.into_iter(),
+        ));
+    }
+    if let Some(entries) = crate::bulk::directory(path, expected) {
+        return Ok(Box::new(entries.into_iter().map(Ok)));
+    }
+    let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink()
+        || !current.is_dir()
+        || current.dev() != expected.dev()
+        || current.ino() != expected.ino()
+    {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    read_dir(path)
 }
 pub fn read_dir(path: &Path) -> io::Result<Box<dyn Iterator<Item = io::Result<Entry>>>> {
     if is_cloud(path) && std::env::var_os("MINORMINOR_WORKER").is_some() {
@@ -185,12 +257,34 @@ pub fn worker() -> Result<()> {
         println!("{row}");
         let _ = io::stdout().flush();
     };
+    if request["mode"] == "probe" || request["mode"] == "probe-database" {
+        emit(
+            match probe_local(&path, request["mode"] == "probe-database") {
+                Ok(row) => row,
+                Err(e) => json!({"code":e.raw_os_error().unwrap_or(libc::EIO)}),
+            },
+        );
+        return Ok(());
+    }
     if request["mode"] == "stat" {
         match fs::symlink_metadata(&path) {
             Ok(m) => emit(json!({"path":path,"metadata":Metadata::of(&m)})),
             Err(e) => emit(json!({"code":e.raw_os_error().unwrap_or(libc::EIO)})),
         }
         return Ok(());
+    }
+    if !request["expected"].is_null() {
+        match fs::symlink_metadata(&path) {
+            Ok(m)
+                if m.is_dir()
+                    && !m.file_type().is_symlink()
+                    && request["expected"]["dev"].as_u64() == Some(m.dev())
+                    && request["expected"]["ino"].as_u64() == Some(m.ino()) => {}
+            _ => {
+                emit(json!({"code":libc::ESTALE}));
+                return Ok(());
+            }
+        }
     }
     if fs::canonicalize(&path).ok().as_ref() != Some(&path) {
         emit(json!({"code":libc::ELOOP}));
@@ -211,4 +305,73 @@ pub fn worker() -> Result<()> {
         Err(e) => emit(json!({"code":e.raw_os_error().unwrap_or(libc::EIO)})),
     }
     Ok(())
+}
+
+/// Isolate filesystem calls (including privacy prompts and cloud stalls) from
+/// the job loop. No document contents are returned by this protocol.
+pub fn probe(path: &Path, database: bool) -> io::Result<Value> {
+    let mode = if database { "probe-database" } else { "probe" };
+    let (mut rows, mut timeout) = request(path, mode)?;
+    if timeout && is_cloud(path) {
+        (rows, timeout) = request(path, mode)?;
+    }
+    if timeout {
+        return Ok(json!({"code":libc::ETIMEDOUT}));
+    }
+    rows.into_iter()
+        .next()
+        .ok_or_else(|| io::Error::other("读取检查未返回结果"))
+}
+pub fn probe_local(path: &Path, database: bool) -> io::Result<Value> {
+    #[cfg(target_os = "macos")]
+    use std::os::macos::fs::MetadataExt as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || fs::canonicalize(path)? != path {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    let mut row = json!({"metadata":Metadata::of(&metadata),"uid":metadata.uid(),"mode":metadata.mode() & 0o7777});
+    let read = (|| -> io::Result<()> {
+        if metadata.is_dir() {
+            row["operation"] = json!("directory-list");
+            let handle = crate::directory::Handle::root(path, &Metadata::of(&metadata))?;
+            if let Some(entry) = handle.entries(path)?.next() {
+                entry?;
+            }
+        } else if metadata.is_file() {
+            row["operation"] = json!("file-open");
+            // Do not hydrate cloud placeholders for format detection.
+            #[cfg(target_os = "macos")]
+            if metadata.st_flags() & 0x40000000 != 0 {
+                return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+            }
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)?;
+            let identity = Identity::of(&metadata);
+            if Identity::of(&file.metadata()?) != identity {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            }
+            let mut bytes = Vec::new();
+            (&file)
+                .take(if database { 4096 } else { 1 })
+                .read_to_end(&mut bytes)?;
+            if Identity::of(&file.metadata()?) != identity
+                || Identity::of(&fs::symlink_metadata(path)?) != identity
+            {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            }
+            if database {
+                row["format"] = json!(crate::database::format(&bytes));
+            }
+        } else if !metadata.is_file() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
+        Ok(())
+    })();
+    if let Err(e) = read {
+        row["code"] = json!(e.raw_os_error().unwrap_or(libc::EIO));
+    }
+    Ok(row)
 }

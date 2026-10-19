@@ -3,7 +3,7 @@ use crate::{
     index::{self, Identity},
     scan, Result,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -139,9 +139,39 @@ struct StorageIdentity {
 }
 
 fn project_storage(db: &Connection, scan: &str, project: &str) -> Result<(i64, i64, Value)> {
+    let complete = db
+        .query_row(
+            "SELECT status='complete' FROM scans WHERE id=?",
+            [scan],
+            |r| r.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let cache_key = format!("project-storage-cache-{scan}-{project}");
+    let revision = index::setting(db, "storage-summary-revision")?
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if complete {
+        if let Some(cached) = index::setting(db, &cache_key)? {
+            if let (Some(bytes), Some(files)) = (cached["bytes"].as_i64(), cached["files"].as_i64())
+            {
+                if cached["categories"].is_object() && cached["revision"].as_u64() == Some(revision)
+                {
+                    return Ok((bytes, files, cached["categories"].clone()));
+                }
+            }
+        }
+    }
     // Stream each project once without disk-backed identity sorts. Preserve
     // deduplication even if a single-link file moved during traversal.
-    let mut query = db.prepare_cached("SELECT category,bytes,identity FROM entries WHERE scan=? AND project=? AND directory=0")?;
+    let sql = if crate::compact::is_legacy(db)? {
+        "SELECT category,bytes,identity FROM entries WHERE scan=? AND project=? AND directory=0"
+    } else if crate::overlay::active(db)? {
+        "SELECT category,bytes,CASE WHEN json_type(identity_bits)='array' THEN json_object('dev',json(identity_bits -> '$[0]'),'ino',json(identity_bits -> '$[1]')) ELSE identity_bits END FROM main._entries e WHERE scan=(SELECT id FROM entry_scans WHERE value=?1) AND project=?2 AND directory=0 AND NOT EXISTS(SELECT 1 FROM entry_changes d WHERE d.scan=?1 AND d.path=e.path) UNION ALL SELECT category,bytes,identity FROM entry_changes WHERE scan=?1 AND project=?2 AND directory=0 AND deleted=0"
+    } else {
+        "SELECT category,bytes,CASE WHEN json_type(identity_bits)='array' THEN json_object('dev',json(identity_bits -> '$[0]'),'ino',json(identity_bits -> '$[1]')) ELSE identity_bits END FROM _entries WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND project=? AND directory=0"
+    };
+    let mut query = db.prepare_cached(sql)?;
     let mut entries = query.query(params![scan, project])?;
     let mut bytes = 0_i64;
     let mut files = 0_i64;
@@ -159,19 +189,40 @@ fn project_storage(db: &Connection, scan: &str, project: &str) -> Result<(i64, i
         let previous = links.entry(key).or_insert(0_i64);
         bytes += (size - *previous).max(0);
         *previous = (*previous).max(size);
-        let previous = category_links.entry(category).or_insert_with(HashMap::new).entry(key).or_insert(0_i64);
+        let previous = category_links
+            .entry(category)
+            .or_insert_with(HashMap::new)
+            .entry(key)
+            .or_insert(0_i64);
         totals.0 += (size - *previous).max(0);
         *previous = (*previous).max(size);
     }
-    let categories: serde_json::Map<String, Value> = categories.into_iter()
+    let categories: serde_json::Map<String, Value> = categories
+        .into_iter()
         .map(|(kind, (bytes, files))| (kind, json!({"bytes":bytes,"files":files})))
         .collect();
-    Ok((bytes, files, json!(categories)))
+    let categories = json!(categories);
+    if complete {
+        index::save_setting(
+            db,
+            &cache_key,
+            &json!({"bytes":bytes,"files":files,"categories":categories,"revision":revision}),
+        )?;
+    }
+    Ok((bytes, files, categories))
 }
 
 pub fn projects(db: &Connection, scan: &str) -> Result<Value> {
     let mut stmt = db.prepare("SELECT id,path,name,markers FROM projects WHERE scan=?")?;
-    let base = stmt.query_map([scan], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?
+    let base = stmt
+        .query_map([scan], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut rows = Vec::new();
     for (id, path, name, markers) in base {
@@ -183,7 +234,12 @@ pub fn projects(db: &Connection, scan: &str) -> Result<Value> {
         )?;
         rows.push(json!({"id":id,"name":name,"path":path,"exists":Path::new(&path).is_dir(),"bytes":bytes,"files":count,"categories":kinds,"sessions":associations,"markers":serde_json::from_str::<Value>(&markers).unwrap_or(json!([])),"description":index::setting(db,&format!("project-info-{scan}-{id}"))?.unwrap_or(json!({}))["description"]}));
     }
-    rows.sort_by(|a,b| b["bytes"].as_i64().cmp(&a["bytes"].as_i64()).then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+    rows.sort_by(|a, b| {
+        b["bytes"]
+            .as_i64()
+            .cmp(&a["bytes"].as_i64())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
     Ok(json!({"rows":rows}))
 }
 
@@ -379,6 +435,47 @@ pub fn inspect(resource: &Resource) -> Result<Value> {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn completed_project_cache_is_scoped_and_running_scans_remain_uncached() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = index::connect(&index::initialize(temp.path()).unwrap()).unwrap();
+        for scan in ["current", "other"] {
+            db.execute(
+                "INSERT INTO scans(id,root,created,status) VALUES(?,'/','today','complete')",
+                [scan],
+            )
+            .unwrap();
+        }
+        for (scan, path, ino, bytes) in [
+            ("current", "/one", u64::MAX, 10),
+            ("current", "/two", u64::MAX - 1, 20),
+            ("other", "/one", u64::MAX, 64),
+        ] {
+            let identity = json!({"dev":1,"ino":ino,"size":bytes,"mtime":-1,"mtime_ns":0,"ctime":-2,"ctime_ns":0,"nlink":1});
+            db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category,project) VALUES(?,?,'/','file',0,?,0,0,?,'other','project')",params![scan,path,bytes,identity.to_string()]).unwrap();
+        }
+        let first = project_storage(&db, "current", "project").unwrap();
+        assert_eq!((first.0, first.1), (30, 2));
+        assert_eq!(project_storage(&db, "current", "project").unwrap(), first);
+        assert_eq!(project_storage(&db, "other", "project").unwrap().0, 64);
+        assert_eq!(
+            index::setting(&db, "project-storage-cache-current-project")
+                .unwrap()
+                .unwrap()["bytes"],
+            30
+        );
+        db.execute("UPDATE scans SET status='running' WHERE id='current'", [])
+            .unwrap();
+        db.execute("UPDATE entries SET bytes=99 WHERE scan='current'", [])
+            .unwrap();
+        assert_eq!(project_storage(&db, "current", "project").unwrap().0, 198);
+        assert_eq!(
+            index::setting(&db, "project-storage-cache-current-project")
+                .unwrap()
+                .unwrap()["bytes"],
+            30
+        );
+    }
 
     #[test]
     fn streaming_project_storage_matches_full_sql_reference() {
@@ -395,7 +492,9 @@ mod storage_tests {
             ("other", "project", "log", 100, 2, 3, false),
             ("scan", "project", "other", 500, 3, 1, true),
         ];
-        for (i, (scan, project, category, bytes, ino, nlink, directory)) in cases.into_iter().enumerate() {
+        for (i, (scan, project, category, bytes, ino, nlink, directory)) in
+            cases.into_iter().enumerate()
+        {
             // A moved single-link file can leave two indexed paths too.
             db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category,project) VALUES(?,?,'/','file',?,?,0,0,?,?,?)",
                 params![scan,format!("/{i}"),directory,bytes,json!({"dev":1,"ino":ino,"nlink":nlink}).to_string(),category,project]).unwrap();
@@ -403,11 +502,26 @@ mod storage_tests {
         for project in ["project", "other", "empty"] {
             let actual = project_storage(&db, "scan", project).unwrap();
             let expected: i64 = db.query_row("SELECT coalesce(sum(bytes),0) FROM (SELECT max(bytes) bytes FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY json_extract(identity,'$.dev'),json_extract(identity,'$.ino'))",params!["scan",project],|r|r.get(0)).unwrap();
-            let files: i64 = db.query_row("SELECT count(*) FROM entries WHERE scan=? AND project=? AND directory=0",params!["scan",project],|r|r.get(0)).unwrap();
-            assert_eq!((actual.0,actual.1),(expected,files));
+            let files: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM entries WHERE scan=? AND project=? AND directory=0",
+                    params!["scan", project],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!((actual.0, actual.1), (expected, files));
             let mut reference = serde_json::Map::new();
             let mut stmt = db.prepare("SELECT category,sum(bytes),sum(files) FROM (SELECT category,max(bytes) bytes,count(*) files FROM entries WHERE scan=? AND project=? AND directory=0 GROUP BY category,json_extract(identity,'$.dev'),json_extract(identity,'$.ino')) GROUP BY category").unwrap();
-            for row in stmt.query_map(params!["scan",project], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).unwrap() {
+            for row in stmt
+                .query_map(params!["scan", project], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+            {
                 let (kind, bytes, files) = row.unwrap();
                 reference.insert(kind, json!({"bytes":bytes,"files":files}));
             }

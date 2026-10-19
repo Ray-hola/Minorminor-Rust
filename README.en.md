@@ -20,7 +20,7 @@
 
 ## What it does
 
-- Scan in the background and update folder sizes, file categories, projects and AI tool discovery together.
+- Scan in the background and update folder sizes, file categories, projects and AI tool discovery together. Losslessly compressed snapshots publish atomically; folder remeasurement writes small deltas. Existing indexes upgrade automatically. See [index storage](docs/index-storage.en.md).
 - Expand folders and files; inspect caches, logs, sessions, memory, purpose and storage.
 - Select a scope, review individual files, choose Trash or explicitly confirm permanent deletion, and retain per-file receipts.
 - Discover AI tools from installation and directory evidence; optionally review metadata in AI batches or summarize selected files.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark full scans on owned files; optionally compare two native binaries."""
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ import statistics
 import subprocess
 import tempfile
 import time
+from native_index_support import connect_index, index_bytes
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -87,7 +89,7 @@ def run(binary, home, data, expected, expected_dirs, sessions):
     error = worker.stderr.read()
     assert worker.wait() == 0, error
     elapsed = time.monotonic() - started
-    with sqlite3.connect(data / 'index.sqlite3') as db:
+    with contextlib.closing(connect_index(data / 'index.sqlite3')) as db:
         rows = dict(db.execute('SELECT path,logical FROM entries WHERE directory=0'))
         assert rows == expected, 'Full traversal lost files or changed logical sizes'
         directories = {row[0] for row in db.execute('SELECT path FROM entries WHERE directory=1')}
@@ -98,6 +100,7 @@ def run(binary, home, data, expected, expected_dirs, sessions):
         result = dict(seconds=round(elapsed, 3), stages=stages, files=len(rows),
                       directories=db.execute('SELECT count(*) FROM entries WHERE directory=1').fetchone()[0],
                       associations=associated, fingerprint=fingerprint(db))
+    result['indexBytes'] = index_bytes(data)
     print(json.dumps(dict(binary=str(binary), **result)), flush=True)
     return result
 

@@ -290,7 +290,11 @@ impl Collector {
             let mut sample = json!({"features":[],"keys":[],"projects":[]});
             let mut tables = Vec::new();
             if database {
-                if !bytes.starts_with(b"SQLite format 3\0") {
+                let format = crate::database::format(&bytes);
+                if ["empty", "path-reference"].contains(&format) {
+                    continue;
+                }
+                if format != "sqlite" {
                     self.deferred += 1;
                     db.execute(
                         "INSERT INTO errors(scan,path,code,reason) VALUES(?,?,?,?)",
@@ -688,15 +692,17 @@ pub fn installations(db: &Connection, scan: &str, home: &Path) -> Result<()> {
 }
 
 const INSTALLATION_PATHS: &str =
-    "SELECT path FROM entries WHERE scan=? AND directory=0 AND installation=1 ORDER BY path";
+    "SELECT path FROM _entries INDEXED BY entries_installations WHERE scan=(SELECT id FROM entry_scans WHERE value=?) AND directory=0 AND installation=1 ORDER BY path";
 
 fn installation_paths(db: &Connection, scan: &str) -> Result<Vec<String>> {
     let legacy="SELECT path FROM entries WHERE scan=? AND directory=0 AND (name IN ('package.json','app.asar','Info.plist','METADATA','PKG-INFO') OR parent LIKE '%/bin') ORDER BY path";
-    let mut stmt = db.prepare(if crate::compact::is_legacy(db)? {
-        legacy
-    } else {
-        INSTALLATION_PATHS
-    })?;
+    let mut stmt = db.prepare(
+        if crate::compact::is_legacy(db)? || crate::overlay::active(db)? {
+            legacy
+        } else {
+            INSTALLATION_PATHS
+        },
+    )?;
     let rows = stmt.query_map([scan], |r| r.get(0))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -731,8 +737,7 @@ mod installation_tests {
         }
         db.execute_batch("COMMIT; ANALYZE").unwrap();
         let expected = {
-            let sql =
-                INSTALLATION_PATHS.replace("FROM entries WHERE", "FROM entries NOT INDEXED WHERE");
+            let sql="SELECT path FROM entries NOT INDEXED WHERE scan=? AND directory=0 AND installation=1 ORDER BY path";
             let mut stmt = db.prepare(&sql).unwrap();
             let rows = stmt.query_map(["scan"], |r| r.get::<_, String>(0)).unwrap();
             rows.collect::<std::result::Result<Vec<_>, _>>().unwrap()
@@ -1091,14 +1096,9 @@ pub fn installations_with_progress(
 
 pub fn candidates(db: &Connection, scan: &str) -> Result<Value> {
     use std::hash::{Hash, Hasher};
-    let tools = discovery::tools(db, scan)?;
+    let tools = discovery::tool_metadata(db, scan)?;
     let mut rows = Vec::new();
-    for tool in tools["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|t| t["uncertain"] == true)
-    {
+    for tool in tools.iter().filter(|t| t["uncertain"] == true) {
         let proof = &tool["evidence"];
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         format!("{}:{}", tool["path"], proof).hash(&mut hash);

@@ -9,6 +9,146 @@ fn capacity_guard_has_a_real_boundary() {
     assert!(storage::check_capacity(255, 256).is_err());
     assert!(storage::check_capacity(0, 256).is_err());
 }
+
+#[test]
+fn project_session_counts_use_the_covering_index_and_keep_kind_and_scan_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = index::connect(&index::initialize(temp.path()).unwrap()).unwrap();
+    db.execute_batch("BEGIN").unwrap();
+    for scan in ["one", "two"] {
+        for i in 0..3000 {
+            db.execute(
+                "INSERT INTO associations VALUES(?,?,?,'indexed',?,'tool',?,'','readable','',0)",
+                params![
+                    scan,
+                    i.to_string(),
+                    format!("/fixture/{i}"),
+                    format!("project-{}", i % 100),
+                    if i % 3 == 0 { "memory" } else { "session" }
+                ],
+            )
+            .unwrap();
+        }
+    }
+    db.execute_batch("COMMIT").unwrap();
+    let sql = "SELECT count(*) FROM associations WHERE scan=? AND project=? AND kind='session'";
+    assert_eq!(
+        db.query_row(sql, params!["one", "project-17"], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        20
+    );
+    let plan = db
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(params!["one", "project-17"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line
+            .contains("COVERING INDEX associations_project (scan=? AND project=? AND kind=?)")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn planner_optimization_uses_bounded_sampling_without_removing_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = index::connect(&index::initialize(temp.path()).unwrap()).unwrap();
+    db.execute_batch("BEGIN").unwrap();
+    for i in 0..7005 {
+        entry(&db, "keep", i);
+    }
+    db.execute_batch("COMMIT").unwrap();
+    let limits = |sql: &str| {
+        db.prepare(&format!("EXPLAIN {sql}"))
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter_map(|(opcode, limit)| (opcode == "SqlExec").then_some(limit))
+            .collect::<Vec<_>>()
+    };
+    let unbounded = limits("PRAGMA optimize=0x10002");
+    assert!(!unbounded.is_empty() && unbounded.iter().all(|limit| *limit == 0));
+    let bounded = limits(index::OPTIMIZE_SQL);
+    assert!(
+        !bounded.is_empty() && bounded.iter().all(|limit| *limit > 0 && *limit <= 2000),
+        "{bounded:?}"
+    );
+    db.execute_batch("PRAGMA analysis_limit=1000").unwrap();
+    // A stricter connection limit is reused rather than temporarily overridden.
+    assert!(limits(index::OPTIMIZE_SQL).iter().all(|limit| *limit == 0));
+    assert_eq!(
+        db.query_row("PRAGMA analysis_limit", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        1000
+    );
+    index::optimize(&db).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM entries", [], |r| r.get::<_, u64>(0))
+            .unwrap(),
+        7005
+    );
+    assert!(
+        db.query_row("SELECT count(*) FROM sqlite_stat1", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap()
+            > 0
+    );
+}
+
+#[test]
+fn incremental_reclamation_drains_the_whole_batch_and_preserves_live_data() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = index::initialize(temp.path()).unwrap();
+    let db = index::connect(&path).unwrap();
+    db.execute_batch("CREATE TABLE ballast(id INTEGER PRIMARY KEY, value BLOB); BEGIN")
+        .unwrap();
+    for i in 0..2500 {
+        db.execute("INSERT INTO ballast VALUES(?,zeroblob(6000))", [i])
+            .unwrap();
+    }
+    db.execute_batch("COMMIT; DROP TABLE ballast").unwrap();
+    index::save_setting(&db, "keep", &json!({"value":"survives reclamation"})).unwrap();
+    let free = || {
+        db.query_row("PRAGMA freelist_count", [], |r| r.get::<_, u64>(0))
+            .unwrap()
+    };
+    let before = free();
+    assert!(before > 2048);
+    // A partial statement really does reclaim only one page, regardless of N.
+    db.execute_batch("PRAGMA incremental_vacuum(512)").unwrap();
+    assert_eq!(free(), before - 1);
+    storage::reclaim_pages(&db, 512).unwrap();
+    assert_eq!(free(), before - 513);
+    let mut amounts = vec![];
+    storage::recover(&db, false, |stage, amount| {
+        if stage == "compact" {
+            amounts.push(amount);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(free(), 0);
+    assert_eq!(amounts.last(), Some(&0));
+    assert!(
+        amounts.len() <= ((before - 513).div_ceil(2048) + 1) as usize,
+        "{amounts:?}"
+    );
+    assert!(amounts.windows(2).all(|pair| pair[1] < pair[0]));
+    assert_eq!(
+        index::setting(&db, "keep").unwrap().unwrap()["value"],
+        "survives reclamation"
+    );
+    assert_eq!(
+        db.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
 fn entry(db: &rusqlite::Connection, scan: &str, i: usize) {
     db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,identity,category) VALUES(?,?,?,'fixture',0,1,1,1,'{}','cache')",params![scan,format!("/fixture/{i}/{}","x".repeat(800)),"/fixture"]).unwrap();
 }

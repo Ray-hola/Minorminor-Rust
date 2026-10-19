@@ -246,6 +246,59 @@ pub fn legacy_page(db: &Connection, body: &Value) -> Result<Value> {
 }
 pub fn diagnostics(db: &Connection, scan: &str, kind: &str, body: &Value) -> Result<Value> {
     index::assert_scan(db, scan)?;
+    if kind == "errors" {
+        let offset = body["offset"].as_u64().unwrap_or(0) as usize;
+        let query = body["query"].as_str().unwrap_or("").to_lowercase();
+        let status = body["status"].as_str().unwrap_or("");
+        let audit = crate::read_recovery::audit(db, scan)?;
+        let mut stmt = db.prepare("SELECT path,code,reason FROM errors WHERE scan=?")?;
+        let mut rows=stmt.query_map([scan],|r|Ok(json!({"path":r.get::<_,String>(0)?,"code":r.get::<_,String>(1)?,"reason":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        for row in &mut rows {
+            row["category"] = json!(crate::read_recovery::category(
+                row["code"].as_str().unwrap_or(""),
+                std::path::Path::new(row["path"].as_str().unwrap_or(""))
+            ));
+            if let Some(record) = audit.iter().rev().find(|a| {
+                a["path"] == row["path"]
+                    && a["code"] == row["code"]
+                    && a["status"] != "recovered"
+                    && a["status"] != "resolved"
+            }) {
+                *row = record.clone();
+            }
+        }
+        rows.extend(
+            audit
+                .into_iter()
+                .filter(|r| r["status"] == "recovered" || r["status"] == "resolved"),
+        );
+        let mut summary = serde_json::Map::new();
+        for row in &rows {
+            let key = if row["status"] == "resolved" || row["status"] == "recovered" {
+                row["status"].as_str().unwrap()
+            } else {
+                row["category"].as_str().unwrap_or("read-error")
+            };
+            let n = summary.get(key).and_then(Value::as_u64).unwrap_or(0);
+            summary.insert(key.into(), json!(n + 1));
+        }
+        rows.retain(|r| {
+            (status.is_empty()
+                || r["code"] == status
+                || r["category"] == status
+                || r["status"] == status)
+                && (query.is_empty()
+                    || format!("{} {}", r["path"], r["reason"])
+                        .to_lowercase()
+                        .contains(&query))
+        });
+        rows.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        let total = rows.len();
+        let page: Vec<_> = rows.into_iter().skip(offset).take(100).collect();
+        return Ok(
+            json!({"rows":page,"summary":summary,"total":total,"offset":offset,"hasMore":offset.saturating_add(100)<total,"query":query,"status":status}),
+        );
+    }
     let offset = body["offset"].as_i64().unwrap_or(0).max(0);
     let query = body["query"].as_str().unwrap_or("").to_lowercase();
     let status = body["status"].as_str().unwrap_or("");

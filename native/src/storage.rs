@@ -1,7 +1,7 @@
 use crate::{fail, index, Result};
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::{fs, path::Path};
+use std::{fs, os::unix::fs::MetadataExt, path::Path};
 
 pub const RESERVE: u64 = 256 * 1024 * 1024;
 pub fn free_bytes(path: &Path) -> Result<u64> {
@@ -29,6 +29,9 @@ pub fn guard(db: &Connection) -> Result<()> {
     }
     Ok(())
 }
+pub fn guard_path(path: &Path) -> Result<()> {
+    check_capacity(free_bytes(path)?, RESERVE)
+}
 pub fn checkpoint(db: &Connection) -> Result<()> {
     if db.is_autocommit() {
         let _: (i64, i64, i64) = db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
@@ -39,13 +42,22 @@ pub fn checkpoint(db: &Connection) -> Result<()> {
 }
 pub fn status(db: &Connection) -> Result<Value> {
     let path = Path::new(db.path().unwrap_or(""));
-    let size = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let size = |p: &Path| fs::metadata(p).map(|m| m.blocks() * 512).unwrap_or(0);
+    let logical = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let state = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(crate::user_state::FILE);
+    let allocated = size(path)
+        + size(Path::new(&format!("{}-wal", path.display())))
+        + size(&state)
+        + size(Path::new(&format!("{}-wal", state.display())));
     let pages: u64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     let unused: u64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
     let page_size: u64 = db.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let mode: i64 = db.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
     Ok(
-        json!({"path":path,"bytes":size(path)+size(Path::new(&format!("{}-wal",path.display()))),"reusableBytes":unused*page_size,"liveBytes":pages.saturating_sub(unused)*page_size,"freeBytes":free_bytes(path).ok(),"reserveBytes":RESERVE,"incremental":mode==2,"compactLayout":!crate::compact::is_legacy(db)?}),
+        json!({"path":path,"bytes":allocated,"logicalBytes":logical(path)+logical(&state),"compressed":crate::fs_compression::is_compressed(path),"reusableBytes":unused*page_size,"liveBytes":pages.saturating_sub(unused)*page_size,"freeBytes":free_bytes(path).ok(),"reserveBytes":RESERVE,"incremental":mode==2,"compactLayout":!crate::compact::is_legacy(db)?}),
     )
 }
 // Only rebuildable scan tables are removed. Receipts and user settings stay intact.
@@ -65,35 +77,52 @@ pub fn recover(
     if reset {
         db.execute("DELETE FROM review_nodes", [])?;
         db.execute("DELETE FROM reviews", [])?;
-        db.execute("DELETE FROM settings WHERE key IN ('models-snapshot','dirty','last-job','ai-advice','mole-preview') OR key LIKE 'advice-input-%' OR key LIKE 'discovery-coverage-%' OR key LIKE 'project-%'", [])?;
+        db.execute("DELETE FROM settings WHERE key IN ('models-snapshot','dirty','last-job','ai-advice','mole-preview','storage-summary-revision') OR key LIKE 'advice-input-%' OR key LIKE 'discovery-coverage-%' OR key LIKE 'project-%' OR key LIKE 'tool-storage-cache-%'", [])?;
         let info = status(db)?;
         let needed = info["liveBytes"]
             .as_u64()
             .unwrap_or(0)
             .saturating_mul(2)
-            .saturating_add(RESERVE);
+            .saturating_add(8 * 1024 * 1024);
         check_capacity(free_bytes(Path::new(db.path().unwrap()))?, needed)?;
         // An empty scan cache needs only enough scratch space for retained settings/history.
         progress("compact", 0)?;
         db.execute_batch(
             "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA auto_vacuum=INCREMENTAL; VACUUM;",
         )?;
-    } else if db.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))? == 2 {
-        loop {
-            let remaining: u64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
-            if remaining == 0 {
-                break;
-            }
-            db.execute_batch("PRAGMA incremental_vacuum(512)")?;
-            checkpoint(db)?;
-            progress("compact", remaining)?;
-        }
+    } else {
+        reclaim_unused(db, |remaining| progress("compact", remaining))?;
     }
     let _: (i64, i64, i64) = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     })?;
     let after = status(db)?;
     Ok(json!({"before":before,"after":after,"reset":reset}))
+}
+
+pub fn reclaim_unused(db: &Connection, mut progress: impl FnMut(u64) -> Result<()>) -> Result<()> {
+    if db.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))? != 2 {
+        return Ok(());
+    }
+    let mut remaining: u64 = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    progress(remaining)?;
+    while remaining > 0 {
+        reclaim_pages(db, 2048)?;
+        checkpoint(db)?;
+        remaining = db.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        progress(remaining)?;
+    }
+    Ok(())
+}
+
+// This PRAGMA returns one row per reclaimed page. execute_batch only steps once,
+// silently reducing a requested batch to one page and checkpointing each page.
+pub fn reclaim_pages(db: &Connection, limit: u32) -> Result<()> {
+    assert!(limit > 0);
+    let mut statement = db.prepare(&format!("PRAGMA incremental_vacuum({limit})"))?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
 }
 
 pub fn repack_path(data: &Path) -> std::path::PathBuf {
@@ -166,7 +195,7 @@ pub fn prepare_repack(
     Ok(true)
 }
 pub fn install_repack(data: &Path) -> Result<Value> {
-    let path = data.join("index.sqlite3");
+    let path = index::path(data);
     let target = repack_path(data);
     if fs::symlink_metadata(&target)?.file_type().is_symlink() {
         return Err(fail("压缩索引路径异常"));

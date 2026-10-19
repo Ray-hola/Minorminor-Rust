@@ -32,3 +32,13 @@ pub mod access;
 pub mod storage;
 
 pub mod compact;
+pub mod fs_compression;
+pub mod snapshot;
+pub mod user_state;
+
+pub mod bulk;
+
+pub mod overlay;
+
+pub mod directory;
+pub mod read_recovery;

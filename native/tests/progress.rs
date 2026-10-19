@@ -1,17 +1,33 @@
 use minorminor_core::{
     index,
-    server::{merge_progress, Engine},
+    server::{merge_progress, Engine, IndexRecoveryProgress},
 };
 use serde_json::json;
 use std::fs;
 #[test]
 fn stage_changes_keep_disk_counts_and_clear_the_previous_stage_total() {
-    let mut job = json!({"stats":{"stage":"storage","files":1200,"directories":50,"bytes":4096,"completed":50,"total":50}});
+    let mut job = json!({"stats":{"stage":"storage","files":1200,"directories":50,"bytes":4096,"completed":50,"total":50,"assignedEntries":2000}});
     merge_progress(&mut job, &json!({"stage":"models"}));
     assert_eq!(job["stats"]["files"], 1200);
     assert_eq!(job["stats"]["bytes"], 4096);
     assert!(job["stats"].get("total").is_none());
+    assert!(job["stats"].get("assignedEntries").is_none());
     assert!(job["progressAt"].is_string());
+}
+
+#[test]
+fn index_reclamation_reports_remaining_bytes_without_erasing_processed_rows() {
+    let mut progress = IndexRecoveryProgress::new(4096);
+    assert_eq!(progress.update("entries", 4000)["removed"], 4000);
+    assert_eq!(progress.update("parents", 0)["removed"], 4000);
+    let first = progress.update("compact", 1000);
+    assert_eq!(first["completed"], 0);
+    assert_eq!(first["remainingIndexBytes"], 4_096_000);
+    let next = progress.update("compact", 750);
+    assert_eq!(next["removed"], 4000);
+    assert_eq!(next["completed"], 250);
+    assert_eq!(next["total"], 1000);
+    assert_eq!(next["remainingIndexBytes"], 3_072_000);
 }
 #[test]
 fn status_and_cancel_do_not_need_a_working_database() {

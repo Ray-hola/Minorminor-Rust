@@ -59,6 +59,7 @@ impl Fixture {
             data: self.data.clone(),
             disk: false,
             publish: true,
+            index_path: None,
         })
         .unwrap();
         id
@@ -682,4 +683,202 @@ fn using_a_selected_mole_plan_consumes_the_original_whole_cleanup_preview() {
     )
     .is_err());
     assert!(review::prepare(&db, &f.home, &f.resources, preview["id"].as_str().unwrap()).is_err());
+}
+
+#[test]
+fn partial_measurements_deduplicate_new_cross_folder_links_and_preserve_ancestor_errors() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    let marker = f.put("Project/package.json", b"{}");
+    let outside = f.put("Project/outside.bin", vec![1; 8192]);
+    fs::create_dir_all(f.home.join("Project/branch")).unwrap();
+    let scan = f.scan();
+    let mut db = index::connect(&f.db).unwrap();
+    db.execute(
+        "UPDATE entries SET skipped=skipped+1 WHERE scan=? AND path=?",
+        params![scan, index::path_string(&f.home)],
+    )
+    .unwrap();
+    let resources = files::Resources::default();
+    let project = files::projects(&db, &scan).unwrap()["rows"][0]["id"].clone();
+    let page = files::list(&db, &resources, &f.home, &scan, &json!({"project":project})).unwrap();
+    let id = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "branch")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let alias = f.home.join("Project/branch/new-link.bin");
+    fs::hard_link(&outside, &alias).unwrap();
+    let added = f.put("Project/branch/nested/new.bin", vec![2; 16384]);
+    let resource = minorminor_core::measure::authorized(&resources, &id, &scan).unwrap();
+    minorminor_core::measure::run(&mut db, resource, &f.home, &f.data).unwrap();
+    let expected = (marker.metadata().unwrap().blocks()
+        + outside.metadata().unwrap().blocks()
+        + added.metadata().unwrap().blocks())
+        * 512;
+    assert_eq!(
+        db.query_row(
+            "SELECT bytes FROM entries WHERE scan=? AND path=?",
+            params![scan, index::path_string(&f.home)],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        expected
+    );
+    let stats = index::scan_info(&db, &scan).unwrap()["stats"].clone();
+    assert_eq!(stats["files"], 4);
+    assert_eq!(stats["directories"], 4);
+    assert_eq!(
+        db.query_row(
+            "SELECT skipped FROM entries WHERE scan=? AND path=?",
+            params![scan, index::path_string(&f.home)],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    fs::remove_file(&alias).unwrap();
+    let page = files::list(&db, &resources, &f.home, &scan, &json!({"project":project})).unwrap();
+    let id = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "branch")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let resource = minorminor_core::measure::authorized(&resources, id, &scan).unwrap();
+    minorminor_core::measure::run(&mut db, resource, &f.home, &f.data).unwrap();
+    assert_eq!(
+        index::scan_info(&db, &scan).unwrap()["stats"]["bytes"],
+        expected
+    );
+    assert_eq!(index::scan_info(&db, &scan).unwrap()["stats"]["files"], 3);
+}
+
+#[test]
+fn partial_measurement_does_not_reassign_ancestors_or_invalidate_other_project_caches() {
+    let f = Fixture::new();
+    f.put("Alpha/package.json", b"{}");
+    let retained = f.put("Alpha/keep.txt", b"keep");
+    f.put("Alpha/src/code.txt", b"code");
+    f.put("Beta/package.json", b"{}");
+    f.put(
+        ".claude.json",
+        serde_json::to_vec(&json!({"projects":{f.home.to_string_lossy().as_ref():{}}})).unwrap(),
+    );
+    let scan = f.scan();
+    let mut db = index::connect(&f.db).unwrap();
+    let resources = files::Resources::default();
+    let list = files::projects(&db, &scan).unwrap();
+    let alpha = list["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["path"] == index::path_string(&f.home.join("Alpha")))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let beta = list["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["path"] == index::path_string(&f.home.join("Beta")))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let cache = format!("project-storage-cache-{scan}-{beta}");
+    let before = index::setting(&db, &cache).unwrap();
+    let revision = index::setting(&db, "storage-summary-revision").unwrap();
+    let page = files::list(&db, &resources, &f.home, &scan, &json!({"project":alpha})).unwrap();
+    let id = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "src")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    f.put("Alpha/src/new.txt", b"new");
+    let resource = minorminor_core::measure::authorized(&resources, id, &scan).unwrap();
+    minorminor_core::measure::run(&mut db, resource, &f.home, &f.data).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT project FROM entries WHERE scan=? AND path=?",
+            params![scan, index::path_string(&retained)],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        alpha
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT project FROM entries WHERE scan=? AND path=?",
+            params![scan, index::path_string(&f.home.join("Alpha/src/new.txt"))],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        alpha
+    );
+    assert_eq!(index::setting(&db, &cache).unwrap(), before);
+    assert_eq!(
+        index::setting(&db, "storage-summary-revision").unwrap(),
+        revision
+    );
+}
+
+#[test]
+fn a_partial_measurement_updates_the_slash_root_without_zeroing_disk_totals() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    let marker = f.put("Project/package.json", b"{}");
+    let old = f.put("Project/src/a.bin", vec![1; 4096]);
+    let scan = f.scan();
+    let mut db = index::connect(&f.db).unwrap();
+    let initial = index::scan_info(&db, &scan).unwrap()["stats"].clone();
+    let mut dirs = initial["directories"].as_i64().unwrap();
+    for ancestor in f.home.ancestors().skip(1) {
+        let m = fs::symlink_metadata(ancestor).unwrap();
+        db.execute("INSERT INTO entries(scan,path,parent,name,directory,bytes,logical,unique_bytes,files,dirs,identity,category) VALUES(?,?,?,?,1,?,?,?,?,?,?,'other')",params![scan,index::path_string(ancestor),index::path_string(ancestor.parent().unwrap_or(ancestor)),ancestor.file_name().unwrap_or_default().to_string_lossy(),initial["bytes"].as_i64().unwrap(),initial["logicalBytes"].as_i64().unwrap(),initial["bytes"].as_i64().unwrap(),2,dirs,serde_json::to_string(&index::Identity::of(&m)).unwrap()]).unwrap();
+        dirs += 1;
+    }
+    db.execute(
+        "UPDATE scans SET root='/System/Volumes/Data' WHERE id=?",
+        [&scan],
+    )
+    .unwrap();
+    let resources = files::Resources::default();
+    let project = files::projects(&db, &scan).unwrap()["rows"][0]["id"].clone();
+    let page = files::list(&db, &resources, &f.home, &scan, &json!({"project":project})).unwrap();
+    let id = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "src")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let added = f.put("Project/src/nested/b.bin", vec![2; 8192]);
+    let resource = minorminor_core::measure::authorized(&resources, id, &scan).unwrap();
+    minorminor_core::measure::run(&mut db, resource, &f.home, &f.data).unwrap();
+    let info = index::scan_info(&db, &scan).unwrap();
+    assert_eq!(
+        info["stats"]["bytes"],
+        (marker.metadata().unwrap().blocks()
+            + old.metadata().unwrap().blocks()
+            + added.metadata().unwrap().blocks())
+            * 512
+    );
+    assert_eq!(info["stats"]["files"], 3);
+    assert_eq!(
+        info["stats"]["directories"].as_i64().unwrap(),
+        db.query_row("SELECT count(*) FROM entries WHERE directory=1", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    );
 }

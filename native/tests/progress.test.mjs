@@ -74,3 +74,33 @@ test('low index volume preserves the failure and exposes recovery without claimi
   const recovering=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'index-recovery'}});
   assert.ok(recovering.fraction>=.99&&recovering.fraction<1);
 });
+
+test('index reclamation advances from factual remaining pages without claiming completion',()=>{
+  const p=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'index-recovery',completed:250,total:1000,remainingIndexBytes:3072000}});
+  assert.equal(p.fraction,.99125);assert.equal(p.stats.remainingIndexBytes,3072000);assert.notEqual(p.fraction,1);
+});
+
+test('compression and byte verification remain visible until publication',()=>{
+ const compress=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'index-compress',progressUnit:'bytes',completed:50,total:100}});
+ const verify=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'index-verify',progressUnit:'bytes',completed:50,total:100}});
+ assert.equal(compress.step,5);assert.equal(verify.steps,5);
+ assert.ok(compress.fraction<verify.fraction && verify.fraction<1);
+ assert.equal(verify.stats.progressUnit,'bytes');
+});
+
+test('scan timing follows the worker clock across system sleep or a wall-clock adjustment',()=>{
+ const p=scanProgress({kind:'scan',status:'running',createdAt,stats:{stage:'disk',elapsedMs:12000}},Date.parse(createdAt)+1800000);
+ assert.equal(p.elapsedMs,12000);
+ const done=scanProgress({kind:'scan',status:'complete',createdAt,finishedAt:'2026-10-18T00:40:00Z',stats:{elapsedMs:18000}});
+ assert.equal(done.elapsedMs,18000);
+});
+
+
+test('diagnostic recovery refreshes completed scan counters without hiding active jobs',()=>{
+ const boot={jobs:[{id:'s',kind:'scan',status:'complete',stats:{skipped:400}},{id:'r',kind:'read-recovery',status:'complete'}],scan:{id:'s',status:'complete',stats:{skipped:392}}};
+ assert.equal(progressJob(boot).stats.skipped,392);
+ boot.jobs[1].status='running';
+ assert.equal(progressJob(boot).id,'r');
+ const p=scanProgress({kind:'scan',status:'running',stats:{stage:'read-recovery',completed:200,total:400}});
+ assert.ok(p.fraction<1&&p.fraction>=.98);
+});

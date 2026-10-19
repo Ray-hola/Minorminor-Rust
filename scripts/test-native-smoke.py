@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exercise the packaged Rust process with disposable files only."""
 import json, os, pathlib, sqlite3, signal, subprocess, tempfile, time, urllib.request
+from contextlib import closing
+from native_index_support import connect_index
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-APP = ROOT / 'dist/Minorminor.app/Contents/MacOS/Minorminor'
+APP = pathlib.Path(os.environ.get('MINORMINOR_TEST_BINARY', ROOT / 'dist/Minorminor.app/Contents/MacOS/Minorminor'))
 with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary:
     base = pathlib.Path(temporary).resolve()
     home, data = base / 'home', base / 'index'
@@ -51,14 +53,14 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
         assert boot['native'] and boot['config']['permissions']['analysisDocumentRead'] is False
         api('preferences', {'locale':'en'})
         assert api('bootstrap')['preferences']['locale'] == 'en'
-        # Hold the index writer lock: task status and cancellation must remain
-        # responsive even while the worker cannot write its first scan row.
-        lock = sqlite3.connect(data / 'index.sqlite3')
+        # Hold mutable-state writes: private scan construction must preserve
+        # responsive task status and cancellation under a locked database.
+        lock = sqlite3.connect(data / 'user-state.sqlite3')
         lock.execute('BEGIN IMMEDIATE')
         started = time.monotonic()
         blocked = api('scan', {'scope':'home'})
         running = next(j for j in api('jobs')['jobs'] if j['id'] == blocked['id'])
-        assert running['status'] == 'running' and running['stats']['stage'] == 'preparing'
+        assert running['status'] == 'running', running
         capacity=running['stats']['diskSnapshot']
         assert capacity['total']>0 and capacity['free']>=0 and capacity['capturedAt']
         assert running['stats']['estimatedBytes']==capacity['used']
@@ -74,11 +76,15 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
         lock.rollback()
         lock.close()
         result, boot = wait(api('scan', {'scope':'home'}))
+        completed_scan = next(j for j in boot['jobs'] if j['id'] == boot['scan']['id'])
+        assert completed_scan['stats']['elapsedMs'] == result['elapsedMs'] > 0, 'Completed scan duration must include publication work'
         scan = boot['scan']['id']
         assert scan == result['scanId'] and boot['models']['scanId'] == scan
         projects = api('projects', {'scanId':scan})['rows']
         demo = next(p for p in projects if p['name'] == 'Demo')
         assert demo['bytes'] > 0 and demo['sessions'] == 1
+        with closing(connect_index(data / 'index-v4.sqlite3')) as db:
+            assert db.execute('SELECT 1 FROM settings WHERE key=?', ('project-storage-cache-'+scan+'-'+demo['id'],)).fetchone()
         tools = api('tools', {'scanId':scan})['rows']
         assert any(t['name'] == 'unknown-agent' and t['uncertain'] for t in tools)
         page = api('files', {'scanId':scan,'project':demo['id']})
@@ -86,6 +92,19 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
         assert folder['directory'] and folder['bytes'] > 0
         nested = api('files', {'scanId':scan,'project':demo['id'],'directory':folder['id']})
         assert {row['name'] for row in nested['rows']} == {'old.bin','fresh.bin'}
+        # A partial refresh must not expand/rewrite the compressed full snapshot.
+        snapshot_blocks = (data / 'index-v4.sqlite3').stat().st_blocks
+        added = old.parent / 'added.bin'
+        added.write_bytes(b'new fixture data')
+        wait(api('files/measure', {'scanId':scan, 'id':folder['id']}))
+        assert (data / 'index-v4.sqlite3').stat().st_blocks == snapshot_blocks
+        assert getattr((data / 'index-v4.sqlite3').stat(), 'st_flags', 0) & 32
+        refreshed = api('files', {'scanId':scan, 'project':demo['id']})
+        refreshed_folder = next(row for row in refreshed['rows'] if row['name'] == '.cache')
+        refreshed_children = api('files', {'scanId':scan,'project':demo['id'],'directory':refreshed_folder['id']})
+        assert {row['name'] for row in refreshed_children['rows']} == {'old.bin','fresh.bin','added.bin'}
+        with closing(connect_index(data / 'index-v4.sqlite3')) as db:
+            assert db.execute('SELECT logical FROM entries WHERE path=?', (str(added),)).fetchone()[0] == added.stat().st_size
         associated = api('files', {'scanId':scan, 'project':demo['id'], 'kind':'session'})
         excerpt = api('inspect', {'scanId':scan, 'id':associated['rows'][0]['id']})
         assert excerpt['mode'] == 'content' and 'PRIVATE_TRANSCRIPT_MARKER' not in excerpt['excerpt']
@@ -97,13 +116,16 @@ with tempfile.TemporaryDirectory(prefix='minorminor-native-smoke-') as temporary
         assert result['moved'] == 1 and result['skipped'] == 0, result
         assert not old.exists() and fresh.exists()
         receipt = api('receipts', {'jobId':result['jobId']})
+        assert any(row['status'] == 'moved' for row in receipt['rows']), receipt
         moved = next(row for row in receipt['rows'] if row['status'] == 'moved')
         assert pathlib.Path(moved['target']).read_bytes() == b'cache' * 2048
         assert api('bootstrap')['stale'] is True
-        assert not any(b'PRIVATE_TRANSCRIPT_MARKER' in p.read_bytes() for p in data.glob('index.sqlite3*'))
+        assert not any(b'PRIVATE_TRANSCRIPT_MARKER' in p.read_bytes() for p in [*data.glob('index*.sqlite3*'), *data.glob('user-state.sqlite3*')])
         previous_bytes=api('bootstrap')['scan']['stats']['bytes']
         recalibrated=api('scan', {'scope':'home'})
         wait(recalibrated)
+        with closing(connect_index(data / 'index-v4.sqlite3')) as db:
+            assert not db.execute('SELECT 1 FROM settings WHERE key LIKE ?', ('project-storage-cache-'+scan+'-%',)).fetchone(), 'Old snapshot aggregates survived a new scan'
         recalibrated_job=next(j for j in api('jobs')['jobs'] if j['id']==recalibrated['id'])
         assert recalibrated_job['stats']['estimateSource']=='previous-scan'
         assert recalibrated_job['stats']['estimatedBytes']==previous_bytes
