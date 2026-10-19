@@ -1,4 +1,10 @@
 export default Object.freeze({
+  "配置连接": "Configure",
+  "未配置模型": "No model configured",
+  "存储与权限": "Storage and access",
+  "数据与记录": "Data and history",
+  "暂无模型记录": "No models listed",
+  "工具与目录": "Tools and directories",
   "项目范围": "Project scope",
   "全部项目": "All projects",
   "含 AI 记录": "With AI records",

@@ -42,3 +42,7 @@ Estimated progress now captures total and available space before every scan, pre
 Index regressions cover interrupted legacy migration, per-record field equality, unsigned 64-bit identity values, hard-link indexing, indexed parent lookup, cross-snapshot mutation isolation, verified compact publication and physical page reclamation. Fixtures use temporary directories only.
 
 - v0.2.1 UI verification passed: merged project entry, all / AI-record filters, selection and preview invalidation, selected-project-only previews, legacy `#ai` redirects and Chinese/English labels.
+
+- Local UI update verified: models in Settings, detection, model selection, removal confirmation and running-model protection retained; merged tool entries, legacy links, directory browsing, both languages and rapid heading changes passed.
+
+- Settings layout verified: grouped cards, model metadata/actions, empty state, configuration/index dialogs, both languages and no horizontal overflow at 960px. A slow mock detection showed progress and Stop, then collapsed after completion. Native WebKit layout and packaged smoke passed.

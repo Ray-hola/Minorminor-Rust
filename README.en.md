@@ -3,7 +3,7 @@
 <p align="center"><strong>See what takes space. Choose what goes.</strong><br />A standalone macOS app: Rust backend, WebKit window and file-by-file review.</p>
 
 <p align="center">
-  <a href="native/Cargo.toml"><img src="assets/readme/badges/version.svg" alt="Development preview 0.2.1" /></a>
+  <a href="native/Cargo.toml"><img src="assets/readme/badges/version.svg" alt="Development preview 0.2.2" /></a>
   <a href="docs/desktop.en.md#requirements"><img src="assets/readme/badges/macos.svg" alt="macOS 12 or later" /></a>
   <a href="native/Cargo.toml"><img src="assets/readme/badges/rust.svg" alt="Source builds require Rust 1.88 or later" /></a>
   <a href="LICENSE"><img src="assets/readme/badges/license.svg" alt="GPL-3.0 license" /></a>
@@ -15,6 +15,8 @@
 
 ![Rust desktop interface: project storage, categories and file-by-file cleanup](assets/readme/project-cleanup.en.jpg)
 <p align="center"><sub>Actual Rust interface with isolated sample projects and files.</sub></p>
+
+[Preview Settings](assets/readme/settings.jpg)
 
 ## What it does
 
@@ -28,7 +30,7 @@ This repository independently maintains the **Rust Application**. The [Minormino
 
 ## Get started
 
-**[Download v0.2.1 preview · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.1/Minorminor-v0.2.1-macos-arm64.zip)**. Unzip and drag `Minorminor.app` into Applications. Ad-hoc signed, not notarized; see [release notes and checksums](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.1).
+**[Download v0.2.2 preview · Apple Silicon](https://github.com/Ray-hola/Minorminor-Rust/releases/download/v0.2.2/Minorminor-v0.2.2-macos-arm64.zip)**. Unzip and drag `Minorminor.app` into Applications. Ad-hoc signed, not notarized; see [release notes and checksums](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.2).
 
 Source builds require **macOS 12+, Git, Rust 1.88+ and Xcode Command Line Tools**.
 
@@ -42,7 +44,7 @@ You can also double-click **`start.command`**. The first launch compiles the sou
 
 **Scan → browse → select → preview and confirm.** Choose Simplified Chinese or English in the sidebar. File names, paths, content and model responses retain their original language.
 
-This is the **v0.2.1 development preview**. See the [user guide](docs/desktop.en.md) for requirements, access and stored records. Local builds are ad-hoc signed, without Apple Developer ID signing or notarization.
+This is the **v0.2.2 development preview**. See the [user guide](docs/desktop.en.md) for requirements, access and stored records. Local builds are ad-hoc signed, without Apple Developer ID signing or notarization.
 
 ## Cleanup and AI
 

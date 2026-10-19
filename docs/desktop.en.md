@@ -65,7 +65,7 @@ The benchmark checks every file, directory and logical size, then compares stora
 
 Local release benchmark on 2026-10-19: 61,204 files, 2,007 directories and 1,200 session associations, alternating three runs per binary on the same fixture. Median time fell from 18.754 s to 2.158 s (about 8.7×), with identical indexes across all six runs. These are local fixture measurements; actual times depend on storage, cloud directories and permissions, and do not imply the same speedup on every Mac.
 
-The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. The [v0.2.1 preview](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.1) provides an Apple Silicon build; no universal binary or notarized installer is available.
+The build creates `dist/Minorminor.app` for the current architecture. The build copies the pinned Mole engine, protection script and license files, then verifies an ad-hoc signature. It is not Apple Developer ID signing or notarization. The [v0.2.2 preview](https://github.com/Ray-hola/Minorminor-Rust/releases/tag/v0.2.2) provides an Apple Silicon build; no universal binary or notarized installer is available.
 
 UI translations live in `public/locales/en.js`. Use `tr` / `ui` for authored text; interpolate file paths and content unchanged instead of translating the whole DOM.
 
@@ -121,3 +121,10 @@ Index writes check free space on the data volume and reserve 256 MiB. Low space 
 Settings and low-space errors offer index recovery and storage details. Reusable database pages are distinct from released disk space. New databases can return free pages incrementally. A separately confirmed index rebuild removes rebuildable scan caches and compacts the database while preserving settings, receipts and user files. Very low space, concurrent disk use and long-lived readers can still prevent maintenance; WAL files are never deleted to pretend space was reclaimed.
 
 The compact index stores each scan identifier and parent directory once and uses integer references. All eight file identity fields are packed losslessly, including full paths, nanosecond timestamps and hard-link metadata. Legacy records migrate in checked batches before an atomic schema switch; interruption leaves the complete snapshot available for retry. Settings → Optimize index reclaims obsolete scans and, when scratch space permits, publishes a verified compact database while retaining settings and receipts. Insufficient space is reported. New databases reclaim unused pages incrementally. Optimization does not narrow traversal or delete user files.
+
+The single Tools and directories page combines identification evidence, directories, categories and cleanup previews. Old storage links redirect here. Local model detection, selection and removal live in Settings; old model links redirect to Settings.
+
+
+Settings groups model connection and local models in the main area, with storage/access and data/history actions alongside; version and home path sit at the bottom. Narrow windows stack the groups. Model status, size, parameters, digest and use/removal actions remain available. Settings shows background progress only while a task is running.
+
+![Settings with sample data](../assets/readme/settings.jpg)
